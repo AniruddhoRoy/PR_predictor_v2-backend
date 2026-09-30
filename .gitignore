@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Local database and model artifacts
+*.db
+*.sqlite
+model.pkl
+
+# IDE
+.vscode/
+.idea/

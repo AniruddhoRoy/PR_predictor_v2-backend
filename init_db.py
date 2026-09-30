@@ -1,43 +1,10 @@
-from sqlalchemy.orm import Session
+"""Create tables and seed the same data used by the FastAPI startup hook."""
 
-from database import engine, SessionLocal, Base
-from models import User
+from database import Base, SessionLocal, engine
+from app import seed_database
 
 
-def init_database():
-
-    # Create tables if missing
+if __name__ == "__main__":
     Base.metadata.create_all(bind=engine)
-
-
-    db: Session = SessionLocal()
-
-    # Check existing data
-    user_count = db.query(User).count()
-
-
-    if user_count == 0:
-
-        demo_users = [
-            User(
-                name="John",
-                email="john@test.com"
-            ),
-
-            User(
-                name="Alice",
-                email="alice@test.com"
-            )
-        ]
-
-
-        db.add_all(demo_users)
-        db.commit()
-
-        print("Demo data inserted")
-
-    else:
-        print("Database already initialized")
-
-
-    db.close()
+    seed_database()
+    print("Database is ready")

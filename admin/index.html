@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PR Predictor Admin</title>
+  <link rel="stylesheet" href="/admin/admin.css">
+</head>
+<body>
+  <main class="page">
+    <header><div><p class="eyebrow">PR Predictor</p><h1>Admin console</h1></div><button id="logout" class="secondary hidden">Log out</button></header>
+    <section id="login-card" class="card login-card">
+      <h2>Admin sign in</h2><p>Use the seeded admin account or an account promoted by an administrator.</p>
+      <form id="login-form"><label>Username<input id="username" value="admin" required></label><label>Password<input id="password" type="password" value="1234" required></label><button>Sign in</button><p id="login-error" class="error"></p></form>
+    </section>
+    <section id="dashboard" class="hidden">
+      <div id="stats" class="stats"></div>
+      <div class="grid">
+        <section class="card"><div class="section-head"><h2>Users</h2><button id="refresh" class="secondary">Refresh</button></div><div class="table-wrap"><table><thead><tr><th>Username</th><th>Name</th><th>Email</th><th>Role</th><th></th></tr></thead><tbody id="users"></tbody></table></div></section>
+        <section class="card"><h2>Recent predictions</h2><div class="table-wrap"><table><thead><tr><th>User</th><th>Type</th><th>Status</th><th>Created</th></tr></thead><tbody id="predictions"></tbody></table></div></section>
+      </div>
+    </section>
+  </main>
+  <script src="/admin/admin.js"></script>
+</body>
+</html>
