@@ -13,7 +13,6 @@ from typing import Any, Optional
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, or_
@@ -257,7 +256,7 @@ def _subscription_dict(subscription: Subscription) -> dict:
 
 
 @app.post("/predict")
-def predict(body: Any = Body(...), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def predict(body: PredictionRequest | str = Body(...), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     request_data = _prediction_request(body)
     input_type = request_data.input_type.upper()
     prediction_type = request_data.prediction_type.upper()
@@ -320,6 +319,8 @@ def predict(body: Any = Body(...), user: User = Depends(get_current_user), db: S
 
 
 def _prediction_request(body: Any) -> PredictionRequest:
+    if isinstance(body, PredictionRequest):
+        return body
     if isinstance(body, str):
         return PredictionRequest(inputType="GITHUB_URL", predictionType="BOTH", pullRequestUrl=body)
     try:
