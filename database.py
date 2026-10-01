@@ -1,6 +1,6 @@
 """Database configuration.
 
-SQLite is the default so the project works immediately on a student's laptop.
+SQLite is the default database.
 Set DATABASE_URL to the MySQL URL from docker-compose.yml when needed.
 """
 

@@ -21,6 +21,8 @@ python run.py
 
 The interactive API page is at `http://127.0.0.1:8000/docs`. The admin page is at `http://127.0.0.1:8000/admin/` and starts with `admin` / `1234`; set `ADMIN_PASSWORD` before the first startup if you want a different seeded password. Admins can manage model catalog records from the Prediction models section; delete deactivates a model so prediction history remains valid. Change `TOKEN_SECRET` for a shared deployment.
 
+The admin page also works when opened through a separate static server such as VS Code Live Server at `http://127.0.0.1:5500/admin/index.html`. Its API base is configured in the `api-base` meta tag in `admin/index.html` and defaults to `http://127.0.0.1:8000`; start the FastAPI server before signing in.
+
 Prediction scores are deliberately deterministic demo scores. They make the frontend workflow usable without a model file or GitHub credentials; the scoring function can later be replaced in `_calculate_scores` in `app.py`.
 
 See [api_docs.md](api_docs.md), [ER_DIAGRAM.md](ER_DIAGRAM.md), and [SCHEMA_DIAGRAM.md](SCHEMA_DIAGRAM.md) for the integration contract and database design.

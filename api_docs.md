@@ -366,6 +366,8 @@ These endpoints are for the simple browser console at `GET /admin/`. They requir
 
 No API input. Returns the admin HTML page (`200`) with its CSS and JavaScript assets. The page signs in through [`POST /login`](#post-login) and then calls the private JSON endpoints below.
 
+The same `admin/index.html` can be opened from a separate static server such as `http://127.0.0.1:5500/admin/index.html`; it sends API requests to the backend URL in the page's `api-base` meta tag, which defaults to `http://127.0.0.1:8000`.
+
 ### `GET /admin/api/stats`
 
 Authentication: admin bearer token. No input.

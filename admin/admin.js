@@ -1,5 +1,22 @@
+const configuredApiBase = document.querySelector('meta[name="api-base"]')?.content || window.PR_PREDICTOR_API_BASE || "http://127.0.0.1:8000";
+const API_BASE = configuredApiBase.replace(/\/+$/, "");
 const state = { token: localStorage.getItem("pr_admin_token") };
 const $ = (id) => document.getElementById(id);
+
+function apiUrl(path) {
+  return `${API_BASE}/admin/api/${path}`;
+}
+
+async function readResponse(response) {
+  const text = await response.text();
+  let data = {};
+  if (text) {
+    try { data = JSON.parse(text); }
+    catch { throw new Error(`Backend returned a non-JSON response (HTTP ${response.status}). Check that the API is running at ${API_BASE}.`); }
+  }
+  if (!response.ok) throw new Error(data.detail || `Request failed (HTTP ${response.status})`);
+  return data;
+}
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[character]));
@@ -10,10 +27,13 @@ function show(authed) {
   $("logout").classList.toggle("hidden", !authed);
 }
 async function api(path, options = {}) {
-  const response = await fetch(`/admin/api/${path}`, { ...options, headers: { "Content-Type": "application/json", Authorization: `Bearer ${state.token}`, ...(options.headers || {}) } });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.detail || "Request failed");
-  return data;
+  let response;
+  try {
+    response = await fetch(apiUrl(path), { ...options, headers: { "Content-Type": "application/json", Authorization: `Bearer ${state.token}`, ...(options.headers || {}) } });
+  } catch {
+    throw new Error(`Cannot connect to the backend at ${API_BASE}. Start the FastAPI server on port 8000.`);
+  }
+  return readResponse(response);
 }
 function renderStats(stats) {
   $("stats").innerHTML = Object.entries({ Users: stats.users, Predictions: stats.predictions, Models: stats.models, Plans: stats.plans }).map(([name, value]) => `<div class="stat"><span>${name}</span><strong>${value}</strong></div>`).join("");
@@ -55,7 +75,17 @@ $("model-form").onsubmit = async (event) => {
 };
 $("new-model").onclick = () => openModelForm();
 $("cancel-model").onclick = resetModelForm;
-$("login-form").onsubmit = async (event) => { event.preventDefault(); $("login-error").textContent = ""; try { const response = await fetch("/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: $("username").value, password: $("password").value }) }); const data = await response.json(); if (!response.ok) throw new Error(data.detail || "Login failed"); if (data.user.role !== "ADMIN") throw new Error("This account is not an admin"); state.token = data.accessToken; localStorage.setItem("pr_admin_token", state.token); show(true); await load(); } catch (error) { $("login-error").textContent = error.message; } };
+$("login-form").onsubmit = async (event) => {
+  event.preventDefault(); $("login-error").textContent = "";
+  try {
+    let response;
+    try { response = await fetch(`${API_BASE}/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: $("username").value, password: $("password").value }) }); }
+    catch { throw new Error(`Cannot connect to the backend at ${API_BASE}. Start the FastAPI server on port 8000.`); }
+    const data = await readResponse(response);
+    if (data.user.role !== "ADMIN") throw new Error("This account is not an admin");
+    state.token = data.accessToken; localStorage.setItem("pr_admin_token", state.token); show(true); await load();
+  } catch (error) { $("login-error").textContent = error.message; }
+};
 $("logout").onclick = () => { state.token = null; localStorage.removeItem("pr_admin_token"); show(false); };
 $("refresh").onclick = load;
 show(Boolean(state.token));
