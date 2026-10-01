@@ -396,6 +396,98 @@ Success `200`: an array of public user objects (the same fields returned by [`GE
 ]
 ```
 
+### `GET /admin/api/models`
+
+Authentication: admin bearer token. No input.
+
+Success `200`: all model catalog records, including inactive records retained for prediction history.
+
+```json
+[
+  {
+    "modelId": "uuid",
+    "code": "merge-probability-v1",
+    "name": "PR Predictor Demo",
+    "taskType": "BOTH",
+    "version": "1.0",
+    "provider": "local",
+    "description": "A deterministic demo model based on submitted features.",
+    "active": true,
+    "createdAt": "2026-09-30T12:00:00",
+    "retiredAt": null
+  }
+]
+```
+
+### `POST /admin/api/models`
+
+Authentication: admin bearer token. Creates a model catalog record.
+
+Input:
+
+```json
+{
+  "code": "review-model-v2",
+  "name": "Review Model v2",
+  "taskType": "BOTH",
+  "version": "2.0",
+  "provider": "local",
+  "description": "A short description for the model selector.",
+  "active": true
+}
+```
+
+`taskType` must be `MERGE_PROBABILITY`, `PR_QUALITY`, or `BOTH`. `code`, `name`, and `version` are required. `provider`, `description`, and `active` are optional; `active` defaults to `true`.
+
+Success `201`: the created model object using the [`GET /admin/api/models`](#get-adminapimodels) shape. A duplicate code returns `409`.
+
+### `PATCH /admin/api/models/{modelId}`
+
+Authentication: admin bearer token. Path input: `modelId` (UUID string). All body fields are optional and only included fields change.
+
+Input:
+
+```json
+{
+  "name": "Review Model v2.1",
+  "taskType": "PR_QUALITY",
+  "version": "2.1",
+  "provider": "local",
+  "description": "Updated description.",
+  "active": true
+}
+```
+
+The `code` field may also be changed, but it must remain unique. Success `200`: the updated model object. Unknown IDs return `404`, duplicate codes return `409`, and invalid task types return `400`.
+
+### `DELETE /admin/api/models/{modelId}`
+
+Authentication: admin bearer token. Path input: `modelId` (UUID string). No body.
+
+This is a soft delete: the model is marked inactive and receives a retirement timestamp, while historical predictions continue to reference it. Inactive models are not returned by the public [`GET /models`](#get-models) endpoint.
+
+Success `200`:
+
+```json
+{
+  "message": "Model deactivated",
+  "model": {
+    "modelId": "uuid",
+    "code": "review-model-v2",
+    "name": "Review Model v2",
+    "taskType": "BOTH",
+    "version": "2.0",
+    "provider": "local",
+    "description": "A short description for the model selector.",
+    "active": false,
+    "createdAt": "2026-09-30T12:00:00",
+    "retiredAt": "2026-10-01T12:00:00"
+  }
+}
+```
+
+An inactive model can be reactivated with `PATCH /admin/api/models/{modelId}` and `{ "active": true }`.
+
 ### `PATCH /admin/api/users/{userId}/role`
 
 Authentication: admin bearer token. Path input: `userId` (UUID string).

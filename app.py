@@ -27,7 +27,7 @@ from models import (
 )
 from schemas import (
     LoginRequest, PredictionRequest, ProfileUpdate, RegisterRequest,
-    SettingsUpdate, SubscriptionUpdate,
+    SettingsUpdate, SubscriptionUpdate, ModelCreate, ModelUpdate,
 )
 
 
@@ -83,6 +83,7 @@ def health():
     return {"status": "ok"}
 
 
+#! this is a helper function to return a public user representation
 def _public_user(user: User) -> dict:
     return {
         "userId": user.user_id,
@@ -94,7 +95,7 @@ def _public_user(user: User) -> dict:
         "createdAt": user.created_at.isoformat() if user.created_at else None,
     }
 
-
+#! this is a helper function to return a token response
 def _token_response(user: User) -> dict:
     return {"accessToken": create_token(user.user_id, user.role), "tokenType": "bearer", "user": _public_user(user)}
 
@@ -450,6 +451,94 @@ def admin_stats(admin: User = Depends(require_admin), db: Session = Depends(get_
 @app.get("/admin/api/users")
 def admin_users(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     return [_public_user(user) for user in db.query(User).order_by(User.created_at.desc()).all()]
+
+
+def _validate_model_task_type(task_type: str) -> str:
+    task_type = task_type.upper().strip()
+    if task_type not in ALLOWED_PREDICTION_TYPES:
+        raise HTTPException(status_code=400, detail="taskType must be MERGE_PROBABILITY, PR_QUALITY, or BOTH")
+    return task_type
+
+
+def _admin_model_dict(model: MLModel) -> dict:
+    item = _model_dict(model)
+    item.update({
+        "active": model.active,
+        "createdAt": model.created_at.isoformat() if model.created_at else None,
+        "retiredAt": model.retired_at.isoformat() if model.retired_at else None,
+    })
+    return item
+
+
+@app.get("/admin/api/models")
+def admin_models(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    query = db.query(MLModel).order_by(MLModel.active.desc(), MLModel.name)
+    return [_admin_model_dict(model) for model in query.all()]
+
+
+@app.post("/admin/api/models", status_code=status.HTTP_201_CREATED)
+def admin_create_model(data: ModelCreate, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    code = data.code.strip().lower()
+    name = data.name.strip()
+    version = data.version.strip()
+    if not code or not name or not version:
+        raise HTTPException(status_code=400, detail="Model code, name, and version cannot be blank")
+    if db.query(MLModel).filter_by(code=code).first():
+        raise HTTPException(status_code=409, detail="Model code is already in use")
+    model = MLModel(code=code, name=name, task_type=_validate_model_task_type(data.task_type), version=version, provider=data.provider, description=data.description, active=data.active)
+    if not model.active:
+        model.retired_at = datetime.utcnow()
+    db.add(model)
+    db.commit()
+    db.refresh(model)
+    return _admin_model_dict(model)
+
+
+@app.patch("/admin/api/models/{model_id}")
+def admin_update_model(model_id: str, data: ModelUpdate, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    model = db.query(MLModel).filter_by(model_id=model_id).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found")
+    values = data.model_dump(exclude_unset=True, by_alias=False)
+    if "code" in values:
+        code = values["code"].strip().lower()
+        if not code:
+            raise HTTPException(status_code=400, detail="Model code cannot be blank")
+        duplicate = db.query(MLModel).filter(MLModel.code == code, MLModel.model_id != model_id).first()
+        if duplicate:
+            raise HTTPException(status_code=409, detail="Model code is already in use")
+        values["code"] = code
+    if "name" in values:
+        values["name"] = values["name"].strip()
+        if not values["name"]:
+            raise HTTPException(status_code=400, detail="Model name cannot be blank")
+    if "version" in values:
+        values["version"] = values["version"].strip()
+        if not values["version"]:
+            raise HTTPException(status_code=400, detail="Model version cannot be blank")
+    if "task_type" in values:
+        values["task_type"] = _validate_model_task_type(values["task_type"])
+    for key, value in values.items():
+        setattr(model, key, value)
+    if data.active is False:
+        model.retired_at = model.retired_at or datetime.utcnow()
+    elif data.active is True:
+        model.retired_at = None
+    db.commit()
+    db.refresh(model)
+    return _admin_model_dict(model)
+
+
+@app.delete("/admin/api/models/{model_id}")
+def admin_delete_model(model_id: str, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    model = db.query(MLModel).filter_by(model_id=model_id).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found")
+    model.active = False
+    model.retired_at = model.retired_at or datetime.utcnow()
+    db.commit()
+    db.refresh(model)
+    return {"message": "Model deactivated", "model": _admin_model_dict(model)}
 
 
 @app.patch("/admin/api/users/{user_id}/role")

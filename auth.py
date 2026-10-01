@@ -30,6 +30,8 @@ def verify_password(password: str, encoded: str) -> bool:
         return False
 
 
+# ! problem 
+
 def create_token(user_id: str, role: str) -> str:
     payload = {"sub": user_id, "role": role, "exp": int(time.time()) + TOKEN_TTL_SECONDS}
     encoded = _b64(json.dumps(payload, separators=(",", ":")).encode())

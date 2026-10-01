@@ -23,12 +23,13 @@ class User(Base):
     email = Column(String(255), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)
     full_name = Column(String(150), nullable=False)
-    # Authorization stays deliberately small for this project: USER or ADMIN.
+    #! Authorization stays deliberately small for this project: USER or ADMIN.
     role = Column(String(20), nullable=False, default="USER")
     github_profile_url = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     settings = relationship("UserSetting", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    #! uselist = False means that the relationship will return a single object, not a list of objects.
     subscriptions = relationship("Subscription", back_populates="user", cascade="all, delete-orphan")
     usage_periods = relationship("UsagePeriod", back_populates="user", cascade="all, delete-orphan")
     predictions = relationship("Prediction", back_populates="user", cascade="all, delete-orphan")

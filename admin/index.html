@@ -16,9 +16,26 @@
     <section id="dashboard" class="hidden">
       <div id="stats" class="stats"></div>
       <div class="grid">
-        <section class="card"><div class="section-head"><h2>Users</h2><button id="refresh" class="secondary">Refresh</button></div><div class="table-wrap"><table><thead><tr><th>Username</th><th>Name</th><th>Email</th><th>Role</th><th></th></tr></thead><tbody id="users"></tbody></table></div></section>
+        <section class="card"><div class="section-head"><h2>Users</h2><button id="refresh" class="secondary" type="button">Refresh</button></div><div class="table-wrap"><table><thead><tr><th>Username</th><th>Name</th><th>Email</th><th>Role</th><th></th></tr></thead><tbody id="users"></tbody></table></div></section>
         <section class="card"><h2>Recent predictions</h2><div class="table-wrap"><table><thead><tr><th>User</th><th>Type</th><th>Status</th><th>Created</th></tr></thead><tbody id="predictions"></tbody></table></div></section>
       </div>
+      <section class="card model-card">
+        <div class="section-head"><div><h2>Prediction models</h2><p class="helper">Add, edit, activate, or deactivate the models available to users.</p></div><button id="new-model" class="secondary" type="button">New model</button></div>
+        <form id="model-form" class="model-form hidden">
+          <input id="model-id" type="hidden">
+          <div class="model-form-grid">
+            <label>Code<input id="model-code" placeholder="review-model-v2" required></label>
+            <label>Name<input id="model-name" placeholder="Review Model v2" required></label>
+            <label>Task type<select id="model-task"><option value="BOTH">BOTH</option><option value="MERGE_PROBABILITY">MERGE_PROBABILITY</option><option value="PR_QUALITY">PR_QUALITY</option></select></label>
+            <label>Version<input id="model-version" placeholder="2.0" required></label>
+            <label>Provider<input id="model-provider" placeholder="local"></label>
+            <label class="checkbox-label"><input id="model-active" type="checkbox" checked> Active</label>
+          </div>
+          <label>Description<textarea id="model-description" rows="2" placeholder="Short description for the model selector"></textarea></label>
+          <div class="form-actions"><button type="submit">Save model</button><button id="cancel-model" class="secondary" type="button">Cancel</button><p id="model-error" class="error"></p></div>
+        </form>
+        <div class="table-wrap"><table><thead><tr><th>Code</th><th>Name</th><th>Task</th><th>Version</th><th>Provider</th><th>Status</th><th></th></tr></thead><tbody id="models"></tbody></table></div>
+      </section>
     </section>
   </main>
   <script src="/admin/admin.js"></script>
