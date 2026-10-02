@@ -42,6 +42,7 @@ app.add_middleware(
 
 ADMIN_DIR = Path(__file__).parent / "admin"
 
+# ! problem
 bearer = HTTPBearer(auto_error=False)
 GITHUB_PR_RE = re.compile(r"^https?://github\.com/([^/]+)/([^/]+)/pull/(\d+)/?$", re.I)
 ALLOWED_PREDICTION_TYPES = {"MERGE_PROBABILITY", "PR_QUALITY", "BOTH"}
@@ -100,6 +101,8 @@ def _token_response(user: User) -> dict:
     return {"accessToken": create_token(user.user_id, user.role), "tokenType": "bearer", "user": _public_user(user)}
 
 
+#! db: Session = Depends(get_db) ,  This is FastAPI's dependency injection. It tells FastAPI: "before running this endpoint, call get_db() and hand me the result as db."
+
 @app.post("/register", status_code=status.HTTP_201_CREATED)
 def register(data: RegisterRequest, db: Session = Depends(get_db)):
     username = data.username.strip().lower()
@@ -156,8 +159,19 @@ def get_profile(user: User = Depends(get_current_user)):
     return _public_user(user)
 
 
+
+#! Depends tells FastAPI: "don't expect this value from the client; get it by calling this function for me."
+
+#! Without Depends, FastAPI assumes a parameter comes from the request itself (body, query string, path). With Depends(some_function), FastAPI runs some_function first and passes its return value in as the parameter.
 @app.patch("/profile")
 def update_profile(data: ProfileUpdate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+#! values = data.model_dump(exclude_unset=True, by_alias=False)
+model_dump() converts the Pydantic model into a plain dict.
+exclude_unset=True leaves out any field the client didn't include in the JSON. This is what lets you tell "field not sent" (ignore it) from "field sent as null" (clear it).
+by_alias=False uses the Python field names (github_profile_url) instead of any aliases (such as camelCase githubProfileUrl) the model defines for the JSON.
+#? So if the client sends {"full_name": "Ali"}, values is just {"full_name": "Ali"}.
+    """
     values = data.model_dump(exclude_unset=True, by_alias=False)
     if "email" in values:
         email = values["email"].strip().lower()
@@ -207,6 +221,7 @@ def _settings_dict(settings: UserSetting) -> dict:
     return {"themeMode": settings.theme_mode, "notificationsEnabled": settings.notifications_enabled, "defaultPredictionType": settings.default_prediction_type, "defaultInputMode": settings.default_input_mode}
 
 
+#! prediction_type: Optional[str] = Query(default=None, alias="predictionType") query parameter
 @app.get("/models")
 def models(prediction_type: Optional[str] = Query(default=None, alias="predictionType"), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     query = db.query(MLModel).filter_by(active=True)
@@ -255,6 +270,9 @@ def _active_subscription(db: Session, user: User) -> Subscription:
 def _subscription_dict(subscription: Subscription) -> dict:
     return {"subscriptionId": subscription.subscription_id, "status": subscription.status, "startedAt": subscription.started_at.isoformat(), "plan": {"code": subscription.plan.code, "name": subscription.plan.name, "monthlyPredictionLimit": subscription.plan.monthly_prediction_limit, "description": subscription.plan.description}}
 
+
+
+#### todo Pediction Happends Here (Start)
 
 @app.post("/predict")
 def predict(body: PredictionRequest | str = Body(...), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -393,6 +411,8 @@ def _recommendation(merge_score: float, quality_score: float) -> str:
         return "Review the change size and test coverage before merging."
     return "Add tests and split the change into smaller parts before merging."
 
+
+#### todo Pediction Happends Here (End)
 
 @app.get("/history")
 @app.get("/predictions")
