@@ -15,7 +15,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, or_
+from sqlalchemy import func, inspect, or_, text
 from sqlalchemy.orm import Session
 
 from auth import create_token, hash_password, read_token, verify_password
@@ -27,8 +27,9 @@ from models import (
 )
 from schemas import (
     LoginRequest, PredictionRequest, ProfileUpdate, RegisterRequest,
-    SettingsUpdate, SubscriptionUpdate, ModelCreate, ModelUpdate,
+    SettingsUpdate, SubscriptionUpdate, ModelCreate, ModelUpdate, PlanCreate, PlanUpdate,
 )
+from prediction_engine import ARTIFACTS, github_features, infer, normalize_features
 
 
 app = FastAPI(title="PR Predictor API", version="1.0.0")
@@ -51,18 +52,88 @@ ALLOWED_PREDICTION_TYPES = {"MERGE_PROBABILITY", "PR_QUALITY", "BOTH"}
 @app.on_event("startup")
 def startup_event():
     Base.metadata.create_all(bind=engine)
+    ensure_schema()
     seed_database()
+
+
+def ensure_schema():
+    # This small project has no migration tool. Add new columns when an older local SQLite file is reused.
+    inspector = inspect(engine)
+    additions = {
+        "plans": {"monthly_credits": "INTEGER NOT NULL DEFAULT 5", "parent_plan_id": "VARCHAR(36)"},
+        "models": {"credit_cost": "INTEGER NOT NULL DEFAULT 1"},
+        "usage_periods": {"credits_used": "INTEGER NOT NULL DEFAULT 0", "credit_limit_snapshot": "INTEGER NOT NULL DEFAULT 5"},
+        "predictions": {"credits_cost": "INTEGER NOT NULL DEFAULT 1"},
+    }
+    with engine.begin() as connection:
+        for table, columns in additions.items():
+            existing = {column["name"] for column in inspector.get_columns(table)}
+            for column, definition in columns.items():
+                if column not in existing:
+                    connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {definition}"))
 
 
 def seed_database():
     db = SessionLocal()
     try:
+        # Migrate the old PREMIUM label to PLUS when this is an existing local database.
+        plus = db.query(Plan).filter_by(code="PLUS").first()
+        premium = db.query(Plan).filter_by(code="PREMIUM").first()
+        if not plus and premium:
+            premium.code = "PLUS"
+            plus = premium
         if not db.query(Plan).filter_by(code="FREE").first():
-            db.add(Plan(code="FREE", name="Free", monthly_prediction_limit=5, description="5 predictions each month"))
-        if not db.query(Plan).filter_by(code="PREMIUM").first():
-            db.add(Plan(code="PREMIUM", name="Premium", monthly_prediction_limit=None, description="Unlimited predictions for the demo"))
-        if not db.query(MLModel).filter_by(code="merge-probability-v1").first():
-            db.add(MLModel(code="merge-probability-v1", name="PR Predictor Demo", task_type="BOTH", version="1.0", provider="local", description="A deterministic demo model based on submitted features."))
+            db.add(Plan(code="FREE", name="Free", monthly_credits=20, monthly_prediction_limit=5, description="20 credits each month"))
+        if not plus:
+            plus = Plan(code="PLUS", name="Plus", monthly_credits=100, description="100 credits each month")
+            db.add(plus)
+        plans = {
+            "FREE": ("Free", 20), "PLUS": ("Plus", 100),
+            "PRO": ("Pro", 250), "ULTRA": ("Ultra", 1000),
+        }
+        for code, (name, credits) in plans.items():
+            plan = db.query(Plan).filter_by(code=code).first()
+            if not plan:
+                plan = Plan(code=code, name=name, monthly_credits=credits, description=f"{credits} credits each month")
+                db.add(plan)
+            else:
+                plan.name = name
+                plan.monthly_credits = credits
+                plan.description = f"{credits} credits each month"
+                plan.active = True
+        db.flush()
+        free = db.query(Plan).filter_by(code="FREE").first()
+        plus = db.query(Plan).filter_by(code="PLUS").first()
+        pro = db.query(Plan).filter_by(code="PRO").first()
+        ultra = db.query(Plan).filter_by(code="ULTRA").first()
+        plus.parent = free
+        pro.parent = plus
+        ultra.parent = pro
+        model_defaults = {
+            "logistic-regression": ("Logistic Regression", 1),
+            "decision-tree": ("Decision Tree", 2),
+            "knn": ("KNN", 2),
+            "random-forest": ("Random Forest", 5),
+            "sgd-classifier": ("SGD Classifier", 1),
+        }
+        for code, (name, cost) in model_defaults.items():
+            model = db.query(MLModel).filter_by(code=code).first()
+            if not model:
+                model = MLModel(code=code, name=name, task_type="BOTH", version="notebook-v1", provider="scikit-learn", description=f"Trained pipeline from EDA_MY.ipynb ({name}).", credit_cost=cost)
+                db.add(model)
+            else:
+                model.credit_cost = cost
+                model.active = True
+        legacy = db.query(MLModel).filter_by(code="merge-probability-v1").first()
+        if legacy:
+            legacy.active = False
+            legacy.retired_at = legacy.retired_at or datetime.utcnow()
+        db.flush()
+        model_by_code = {model.code: model for model in db.query(MLModel).all()}
+        free.models = [model_by_code["logistic-regression"]]
+        plus.models = [model_by_code["decision-tree"], model_by_code["knn"]]
+        pro.models = [model_by_code["random-forest"]]
+        ultra.models = [model_by_code["sgd-classifier"]]
         admin = db.query(User).filter_by(username="admin").first()
         if not admin:
             admin = User(username="admin", email="admin@example.com", full_name="Project Admin", role="ADMIN", password_hash=hash_password(os.getenv("ADMIN_PASSWORD", "1234")))
@@ -222,9 +293,37 @@ def _settings_dict(settings: UserSetting) -> dict:
 
 
 #! prediction_type: Optional[str] = Query(default=None, alias="predictionType") query parameter
+@app.get("/plans")
+def plans(db: Session = Depends(get_db)):
+    return [_plan_dict(plan, db) for plan in db.query(Plan).filter_by(active=True).order_by(Plan.monthly_credits).all()]
+
+
+def _resolved_plan_models(plan: Plan, seen=None) -> list[MLModel]:
+    seen = set() if seen is None else seen
+    if plan.plan_id in seen:
+        return []
+    seen.add(plan.plan_id)
+    result = list(plan.models)
+    if plan.parent:
+        result += _resolved_plan_models(plan.parent, seen)
+    unique = {model.model_id: model for model in result}
+    return sorted(unique.values(), key=lambda item: item.name.lower())
+
+
+def _plan_dict(plan: Plan, db: Session | None = None) -> dict:
+    return {
+        "planId": plan.plan_id, "code": plan.code, "name": plan.name,
+        "monthlyCredits": plan.monthly_credits, "description": plan.description,
+        "active": plan.active, "parentPlanCode": plan.parent.code if plan.parent else None,
+        "models": [_model_dict(model) for model in _resolved_plan_models(plan)],
+    }
+
+
 @app.get("/models")
 def models(prediction_type: Optional[str] = Query(default=None, alias="predictionType"), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    query = db.query(MLModel).filter_by(active=True)
+    active_plan = _active_subscription(db, user).plan
+    allowed_ids = {model.model_id for model in _resolved_plan_models(active_plan)}
+    query = db.query(MLModel).filter(MLModel.active.is_(True), MLModel.model_id.in_(allowed_ids))
     if prediction_type:
         prediction_type = prediction_type.upper()
         query = query.filter(or_(MLModel.task_type == "BOTH", MLModel.task_type == prediction_type))
@@ -232,13 +331,18 @@ def models(prediction_type: Optional[str] = Query(default=None, alias="predictio
 
 
 def _model_dict(model: MLModel) -> dict:
-    return {"modelId": model.model_id, "code": model.code, "name": model.name, "taskType": model.task_type, "version": model.version, "provider": model.provider, "description": model.description}
+    return {"modelId": model.model_id, "code": model.code, "name": model.name, "taskType": model.task_type, "version": model.version, "provider": model.provider, "description": model.description, "creditCost": model.credit_cost}
+
+
+@app.get("/active-plan")
+def get_active_plan(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return _plan_dict(_active_subscription(db, user).plan, db)
 
 
 @app.get("/subscription")
 def get_subscription(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     subscription = _active_subscription(db, user)
-    return _subscription_dict(subscription)
+    return _subscription_dict(subscription, db)
 
 
 @app.post("/subscription")
@@ -253,7 +357,7 @@ def change_subscription(data: SubscriptionUpdate, user: User = Depends(get_curre
     db.add(subscription)
     db.commit()
     db.refresh(subscription)
-    return _subscription_dict(subscription)
+    return _subscription_dict(subscription, db)
 
 
 def _active_subscription(db: Session, user: User) -> Subscription:
@@ -267,8 +371,8 @@ def _active_subscription(db: Session, user: User) -> Subscription:
     return subscription
 
 
-def _subscription_dict(subscription: Subscription) -> dict:
-    return {"subscriptionId": subscription.subscription_id, "status": subscription.status, "startedAt": subscription.started_at.isoformat(), "plan": {"code": subscription.plan.code, "name": subscription.plan.name, "monthlyPredictionLimit": subscription.plan.monthly_prediction_limit, "description": subscription.plan.description}}
+def _subscription_dict(subscription: Subscription, db: Session | None = None) -> dict:
+    return {"subscriptionId": subscription.subscription_id, "status": subscription.status, "startedAt": subscription.started_at.isoformat(), "plan": _plan_dict(subscription.plan, db)}
 
 
 
