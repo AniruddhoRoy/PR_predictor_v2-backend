@@ -61,6 +61,8 @@ class ModelCreate(BaseModel):
     version: str = Field(min_length=1, max_length=80)
     provider: Optional[str] = None
     description: Optional[str] = None
+    credit_cost: int = Field(default=1, ge=1, le=100000, alias="creditCost")
+    artifact_key: Optional[str] = Field(default=None, alias="artifactKey")
     active: bool = True
     model_config = ConfigDict(populate_by_name=True)
 
@@ -71,6 +73,30 @@ class ModelUpdate(BaseModel):
     task_type: Optional[str] = Field(default=None, alias="taskType")
     version: Optional[str] = Field(default=None, min_length=1, max_length=80)
     provider: Optional[str] = None
+    description: Optional[str] = None
+    credit_cost: Optional[int] = Field(default=None, ge=1, le=100000, alias="creditCost")
+    artifact_key: Optional[str] = Field(default=None, alias="artifactKey")
+    active: Optional[bool] = None
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class PlanCreate(BaseModel):
+    code: str = Field(min_length=2, max_length=80)
+    name: str = Field(min_length=1, max_length=150)
+    monthly_credits: int = Field(alias="monthlyCredits", ge=0, le=1000000000)
+    parent_plan_code: Optional[str] = Field(default=None, alias="parentPlanCode")
+    model_codes: list[str] = Field(default_factory=list, alias="modelCodes")
+    description: Optional[str] = None
+    active: bool = True
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class PlanUpdate(BaseModel):
+    code: Optional[str] = Field(default=None, min_length=2, max_length=80)
+    name: Optional[str] = Field(default=None, min_length=1, max_length=150)
+    monthly_credits: Optional[int] = Field(default=None, ge=0, le=1000000000, alias="monthlyCredits")
+    parent_plan_code: Optional[str] = Field(default=None, alias="parentPlanCode")
+    model_codes: Optional[list[str]] = Field(default=None, alias="modelCodes")
     description: Optional[str] = None
     active: Optional[bool] = None
     model_config = ConfigDict(populate_by_name=True)

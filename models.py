@@ -5,11 +5,19 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean, Column, Date, DateTime, ForeignKey, Integer, Numeric, String,
-    Text, UniqueConstraint,
+    Table, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 
 from database import Base
+
+
+plan_model_access = Table(
+    "plan_model_access",
+    Base.metadata,
+    Column("plan_id", String(36), ForeignKey("plans.plan_id"), primary_key=True),
+    Column("model_id", String(36), ForeignKey("models.model_id"), primary_key=True),
+)
 
 
 def new_id():
@@ -52,9 +60,14 @@ class Plan(Base):
     code = Column(String(80), unique=True, nullable=False)
     name = Column(String(150), nullable=False)
     monthly_prediction_limit = Column(Integer, nullable=True)
+    monthly_credits = Column(Integer, nullable=False, default=5)
+    parent_plan_id = Column(String(36), ForeignKey("plans.plan_id"), nullable=True)
     description = Column(Text, nullable=False, default="")
     active = Column(Boolean, nullable=False, default=True)
     subscriptions = relationship("Subscription", back_populates="plan")
+    parent = relationship("Plan", remote_side=[plan_id], back_populates="children")
+    children = relationship("Plan", back_populates="parent")
+    models = relationship("MLModel", secondary=plan_model_access, back_populates="plans")
 
 
 class Subscription(Base):
@@ -80,10 +93,13 @@ class MLModel(Base):
     version = Column(String(80), nullable=False, default="1.0")
     provider = Column(String(100), nullable=True)
     description = Column(Text, nullable=True)
+    credit_cost = Column(Integer, nullable=False, default=1)
+    artifact_key = Column(String(80), nullable=True)
     active = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     retired_at = Column(DateTime, nullable=True)
     predictions = relationship("Prediction", back_populates="model")
+    plans = relationship("Plan", secondary=plan_model_access, back_populates="models")
 
 
 class UsagePeriod(Base):
@@ -95,6 +111,8 @@ class UsagePeriod(Base):
     period_end = Column(Date, nullable=False)
     predictions_used = Column(Integer, nullable=False, default=0)
     limit_snapshot = Column(Integer, nullable=True)
+    credits_used = Column(Integer, nullable=False, default=0)
+    credit_limit_snapshot = Column(Integer, nullable=False, default=5)
     user = relationship("User", back_populates="usage_periods")
     predictions = relationship("Prediction", back_populates="usage_period")
 
@@ -137,6 +155,8 @@ class Prediction(Base):
     prediction_type = Column(String(30), nullable=False)
     status = Column(String(20), nullable=False, default="COMPLETED")
     model_version = Column(String(80), nullable=False)
+    credits_cost = Column(Integer, nullable=False, default=1)
+    inference_key = Column(String(80), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     completed_at = Column(DateTime, nullable=True)
     error_message = Column(Text, nullable=True)
