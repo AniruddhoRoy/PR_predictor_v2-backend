@@ -1,6 +1,5 @@
 """Small adapter around the classifiers built in models(notebook)/EDA_MY.ipynb."""
 
-import hashlib
 from functools import lru_cache
 from pathlib import Path
 
@@ -33,7 +32,8 @@ MODEL_NAMES = {
 def _number(values, *names):
     for name in names:
         try:
-            return float(values.get(name, 0) or 0)
+            if name in values:
+                return float(values[name] or 0)
         except (TypeError, ValueError):
             pass
     return 0.0
@@ -63,15 +63,6 @@ def _row(values):
     return row
 
 
-def _fallback(row, seed):
-    changed = row["total_files_touched"]
-    lines = row["total_lines_changed"]
-    tests = row["files_added"] > 0 and row["task_type"].lower() in {"test", "fix"}
-    digest = int(hashlib.sha256(seed.encode()).hexdigest()[:4], 16)
-    score = 72 - changed * 1.2 - lines * 0.03 + (8 if tests else 0) + (digest % 7 - 3)
-    return max(5.0, min(98.0, score))
-
-
 def _classifier(name):
     from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
     from sklearn.linear_model import LogisticRegression, SGDClassifier
@@ -79,7 +70,7 @@ def _classifier(name):
     from sklearn.tree import DecisionTreeClassifier
 
     if name == "random-forest":
-        return RandomForestClassifier(n_estimators=80, class_weight="balanced", random_state=42, n_jobs=-1)
+        return RandomForestClassifier(n_estimators=100, class_weight="balanced", random_state=42, n_jobs=-1)
     if name == "knn":
         return KNeighborsClassifier(n_neighbors=5)
     if name == "decision-tree":
@@ -98,6 +89,7 @@ def _pipeline(model_name):
     import pandas as pd
     from sklearn.compose import ColumnTransformer
     from sklearn.impute import SimpleImputer
+    from sklearn.model_selection import train_test_split
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import OneHotEncoder, RobustScaler
 
@@ -112,21 +104,21 @@ def _pipeline(model_name):
     categorical = Pipeline([( "inputer", SimpleImputer(strategy="most_frequent")), ("encoder", OneHotEncoder(handle_unknown="ignore", drop="first", sparse_output=False))])
     preprocessor = ColumnTransformer([("num", numeric, NUMERIC), ("cat", categorical, CATEGORICAL)])
     pipeline = Pipeline([("preprocessor", preprocessor), ("model", _classifier(model_name))])
-    pipeline.fit(frame[NUMERIC + CATEGORICAL], frame["label"])
+    x_train, _, y_train, _ = train_test_split(frame[NUMERIC + CATEGORICAL], frame["label"], test_size=0.33, random_state=42)
+    pipeline.fit(x_train, y_train)
     return pipeline
 
 
-def predict(features, model_key, seed=""):
+def predict(features, model_key):
     row = _row(features)
-    model_name = MODEL_NAMES.get((model_key or "model-1").lower(), "logistic-regression")
-    try:
-        import pandas as pd
-        pipeline = _pipeline(model_name)
-        values = pipeline.predict_proba(pd.DataFrame([row]))[0]
-        classes = list(pipeline.classes_)
-        score = float(values[classes.index(1)] if 1 in classes else values[-1]) * 100
-    except Exception:
-        score = _fallback(row, seed)
+    model_name = MODEL_NAMES.get((model_key or "model-1").lower())
+    if not model_name:
+        raise ValueError("Unknown notebook model")
+    import pandas as pd
+    pipeline = _pipeline(model_name)
+    values = pipeline.predict_proba(pd.DataFrame([row]))[0]
+    classes = list(pipeline.classes_)
+    score = float(values[classes.index(1)]) * 100
     score = round(max(0.0, min(100.0, score)), 2)
     factors = [
         {"factor_name": "Change size", "description": f"{int(row['total_files_touched'])} files and {int(row['total_lines_changed'])} changed lines were considered.", "impact": "NEGATIVE" if row["total_files_touched"] > 12 else "POSITIVE"},

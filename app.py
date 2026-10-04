@@ -1,12 +1,13 @@
 """Simple PR prediction backend.
 
 The service intentionally keeps the workflow synchronous and understandable:
-request -> validate -> calculate demo scores -> persist -> return result.
+request -> validate -> run notebook model -> persist -> return result.
 """
 
-import hashlib
 import os
 import re
+import json
+from urllib.request import Request, urlopen
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -71,6 +72,10 @@ def migrate_schema():
             for name, definition in columns.items():
                 if name not in names:
                     connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {definition}"))
+                    if name == "monthly_credits":
+                        connection.execute(text("UPDATE plans SET monthly_credits = COALESCE(monthly_prediction_limit, 5)"))
+                    elif name == "credits_used":
+                        connection.execute(text("UPDATE usage_periods SET credits_used = predictions_used"))
 
 
 def seed_database():
@@ -96,26 +101,33 @@ def seed_database():
             models.append(model)
         db.flush()
         plans = {}
+        new_plans = set()
         for code, name, credits in [("FREE", "Free", 5), ("PLUS", "Plus", 30), ("PRO", "Pro", 100), ("ULTRA", "Ultra", 300)]:
             plan = db.query(Plan).filter_by(code=code).first()
             if not plan:
                 plan = Plan(code=code, name=name, monthly_credits=credits, monthly_prediction_limit=credits, description=f"{credits} credits each month")
                 db.add(plan)
+                new_plans.add(code)
             else:
-                plan.monthly_credits = plan.monthly_credits or credits
-                plan.monthly_prediction_limit = plan.monthly_prediction_limit or credits
+                if plan.monthly_credits is None:
+                    plan.monthly_credits = credits
             plans[code] = plan
         db.flush()
-        plans["PLUS"].models = models[:3]
-        plans["PRO"].parent = plans["PLUS"]
-        plans["PRO"].models = models[3:]
-        plans["ULTRA"].parent = plans["PRO"]
-        plans["FREE"].models = models[:1]
+        for code in new_plans:
+            plan = plans[code]
+            if code == "FREE":
+                plan.models = models[:1]
+            elif code == "PLUS":
+                plan.models = models[:3]
+            elif code == "PRO":
+                plan.parent = plans["PLUS"]
+                plan.models = models[3:]
+            elif code == "ULTRA":
+                plan.parent = plans["PRO"]
         # Keep the old demo plan usable for existing accounts.
         old = db.query(Plan).filter_by(code="PREMIUM").first()
-        if old:
-            old.monthly_credits = old.monthly_credits or 100
-            old.models = models[:3]
+        if old and old.monthly_credits is None:
+            old.monthly_credits = 100
         admin = db.query(User).filter_by(username="admin").first()
         if not admin:
             admin = User(username="admin", email="admin@example.com", full_name="Project Admin", role="ADMIN", password_hash=hash_password(os.getenv("ADMIN_PASSWORD", "1234")))
@@ -299,7 +311,11 @@ def get_subscription(user: User = Depends(get_current_user), db: Session = Depen
 @app.get("/active-plan")
 @app.get("/plan")
 def active_plan(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    return _plan_dict(_active_subscription(db, user).plan)
+    plan = _active_subscription(db, user).plan
+    usage = _get_usage(db, user, plan.monthly_credits)
+    result = _plan_dict(plan)
+    result.update(creditsUsed=usage.credits_used, creditsRemaining=max(0, plan.monthly_credits - usage.credits_used))
+    return result
 
 
 @app.get("/plans")
@@ -384,13 +400,18 @@ def predict(body: PredictionRequest | str = Body(...), user: User = Depends(get_
         parsed_url = GITHUB_PR_RE.match(request_data.pull_request_url.strip())
         if not parsed_url:
             raise HTTPException(status_code=400, detail="Use a GitHub pull request URL such as https://github.com/owner/repo/pull/12")
-        features = {"changedFiles": 4 + int(parsed_url.group(3)) % 18, "additions": 20 + int(parsed_url.group(3)) * 3 % 160, "deletions": 5 + int(parsed_url.group(3)) * 2 % 80, "testsAdded": int(parsed_url.group(3)) % 2 == 0}
+        owner, repo_name, number = parsed_url.groups()
+        features = _github_features(owner, repo_name, number)
     else:
         features = request_data.features or {}
         if not features:
             raise HTTPException(status_code=400, detail="features must contain at least one value for MANUAL_FEATURES")
         raw_feature_text = ", ".join(f"{key}={value}" for key, value in features.items())
-    merge_score, quality_score, factors = run_model_prediction(features, model.artifact_key or model.code, request_data.pull_request_url or raw_feature_text or "")
+    try:
+        merge_score, quality_score, factors = run_model_prediction(features, model.artifact_key or model.code)
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="Notebook model is unavailable; no credits were charged") from error
     repository = pull_request = None
     if parsed_url:
         owner, repo_name, number = parsed_url.groups()
@@ -418,9 +439,16 @@ def predict(body: PredictionRequest | str = Body(...), user: User = Depends(get_
     db.flush()
     for index, factor in enumerate(factors):
         db.add(PredictionFactor(result_id=result.result_id, display_order=index, **factor))
-    usage.predictions_used += 1
-    usage.credits_used += model.credit_cost
-    usage.credit_limit_snapshot = plan.monthly_credits
+    # Reserve credits atomically so simultaneous requests cannot overspend.
+    charged = db.query(UsagePeriod).filter(
+        UsagePeriod.usage_period_id == usage.usage_period_id,
+        UsagePeriod.credits_used + model.credit_cost <= plan.monthly_credits,
+    ).update({UsagePeriod.predictions_used: UsagePeriod.predictions_used + 1,
+              UsagePeriod.credits_used: UsagePeriod.credits_used + model.credit_cost,
+              UsagePeriod.credit_limit_snapshot: plan.monthly_credits}, synchronize_session=False)
+    if not charged:
+        db.rollback()
+        raise HTTPException(status_code=429, detail="Not enough credits for this model")
     db.commit()
     db.refresh(prediction)
     return _prediction_dict(prediction)
@@ -476,28 +504,39 @@ def _feature_row(prediction_id: str, name: str, value: Any, source: str) -> Pred
     return PredictionFeature(prediction_id=prediction_id, feature_name=name, value_type="TEXT", value_text=str(value), source=source)
 
 
-def _calculate_scores(features: dict[str, Any], seed: str) -> tuple[float, float, list[dict]]:
-    def number(*names):
-        for name in names:
-            try:
-                return float(features.get(name, 0) or 0)
-            except (TypeError, ValueError):
-                pass
-        return 0.0
-    changed = number("changedFiles", "changed_files")
-    additions = number("additions", "linesAdded", "lines_added")
-    deletions = number("deletions", "linesDeleted", "lines_deleted")
-    tests = features.get("testsAdded", features.get("tests_added", False))
-    tests_bonus = 8 if str(tests).lower() in {"true", "1", "yes"} else 0
-    digest = int(hashlib.sha256(seed.encode()).hexdigest()[:4], 16)
-    merge_score = max(5.0, min(98.0, 74.0 - changed * 0.8 - additions * 0.05 - deletions * 0.03 + tests_bonus + (digest % 11 - 5)))
-    quality_score = max(5.0, min(98.0, 80.0 - changed * 0.7 - additions * 0.04 - deletions * 0.02 + tests_bonus))
-    factors = [
-        {"factor_name": "Change size", "description": f"{int(changed)} changed files and {int(additions + deletions)} line changes were considered.", "impact": "NEGATIVE" if changed > 12 else "POSITIVE"},
-        {"factor_name": "Test coverage", "description": "Tests were included in the submitted features." if tests_bonus else "No added tests were reported in the submitted features.", "impact": "POSITIVE" if tests_bonus else "NEGATIVE"},
-        {"factor_name": "Deletion balance", "description": f"The pull request reports {int(deletions)} deleted lines.", "impact": "POSITIVE" if deletions < additions else "NEUTRAL"},
-    ]
-    return round(merge_score, 2), round(quality_score, 2), factors
+def _github_features(owner, repo, number):
+    """Read actual PR features instead of inventing them from its number."""
+    def fetch(path):
+        headers = {"Accept": "application/vnd.github+json", "User-Agent": "PR-Predictor"}
+        if os.getenv("GITHUB_TOKEN"):
+            headers["Authorization"] = "Bearer " + os.environ["GITHUB_TOKEN"]
+        try:
+            with urlopen(Request("https://api.github.com" + path, headers=headers), timeout=20) as response:
+                return json.load(response)
+        except Exception as error:
+            raise HTTPException(status_code=502, detail="Cannot read GitHub PR; check the URL or GITHUB_TOKEN") from error
+
+    path = f"/repos/{owner}/{repo}"
+    pr = fetch(f"{path}/pulls/{number}")
+    repository = fetch(path)
+    files = []
+    for page in range(1, 31):
+        batch = fetch(f"{path}/pulls/{number}/files?per_page=100&page={page}")
+        files.extend(batch)
+        if len(batch) < 100:
+            break
+    return {
+        "title_word_count": len((pr.get("title") or "").split()),
+        "body_word_count": len((pr.get("body") or "").split()),
+        "total_lines_added": pr["additions"], "total_lines_deleted": pr["deletions"],
+        "total_files_touched": pr["changed_files"], "total_commits": pr["commits"],
+        "files_added": sum(file["status"] == "added" for file in files),
+        "files_modified": sum(file["status"] == "modified" for file in files),
+        "files_deleted": sum(file["status"] == "removed" for file in files),
+        "stars": repository["stargazers_count"], "forks": repository["forks_count"],
+        "language": repository.get("language") or "unknown",
+        "agent": "unknown", "task_type": "unknown",
+    }
 
 
 def _quality_label(score: float) -> str:

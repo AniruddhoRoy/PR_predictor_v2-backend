@@ -1,3 +1,17 @@
+## Credit plans and notebook inference
+
+Plans return `monthlyCredits`; models also return `creditCost` and `artifactKey`.
+
+- `GET /active-plan` or `/plan`: current plan, inherited models, creditsUsed, creditsRemaining (bearer token).
+- `GET /plans`: available plans with monthlyCredits, parentPlanCode, models.
+- `GET /admin/api/plans`: all plans, including directModels.
+- `POST /admin/api/plans`: code, name, monthlyCredits, optional parentPlanCode, modelCodes, description, active.
+- `PATCH /admin/api/plans/{planId}`: same fields, all optional. Null parentPlanCode clears inheritance; empty modelCodes clears direct models.
+- `DELETE /admin/api/plans/{planId}`: deactivate (FREE cannot be deleted).
+- Model create/update accepts creditCost (positive integer) and artifactKey (model-1 through model-6 or classifier name).
+
+Successful predictions spend creditCost once. Insufficient credits returns 429; models excluded by the plan return 403; unavailable notebook inference returns 503 without charging. Plan switching preserves monthly usage. GitHub features come from the GitHub API. Quality score currently uses merge probability because the notebook only trains merge classifiers.
+
 # PR Predictor API documentation
 
 Base URL: `http://127.0.0.1:8000`
@@ -172,17 +186,17 @@ Success `200`:
 [
   {
     "modelId": "uuid",
-    "code": "merge-probability-v1",
+    "code": "model-1",
     "name": "PR Predictor Demo",
     "taskType": "BOTH",
     "version": "1.0",
     "provider": "local",
-    "description": "A deterministic demo model based on submitted features."
+    "description": "Classifier trained from the included notebook dataset."
   }
 ]
 ```
 
-Only active models are returned. The default seeded model code is `merge-probability-v1`.
+Only active models are returned. The default seeded model code is `model-1`.
 
 ### `GET /subscription`
 
@@ -198,8 +212,8 @@ Success `200`:
   "plan": {
     "code": "FREE",
     "name": "Free",
-    "monthlyPredictionLimit": 5,
-    "description": "5 predictions each month"
+    "monthlyCredits": 5,
+    "description": "5 credits each month"
   }
 }
 ```
@@ -222,7 +236,7 @@ Success `200`: the subscription object from [`GET /subscription`](#get-subscript
 
 ### `POST /predict`
 
-Authentication: bearer token. The request is processed synchronously, persisted, and returned as one completed prediction. Free accounts have five predictions per calendar month; Premium accounts are unlimited.
+Authentication: bearer token. The request is processed synchronously, persisted, and returned as one completed prediction. Free accounts have five credits per calendar month. Each model has its own credit cost.
 
 Use one of these input shapes.
 
@@ -232,7 +246,7 @@ GitHub pull request input:
 {
   "inputType": "GITHUB_URL",
   "predictionType": "BOTH",
-  "modelId": "merge-probability-v1",
+  "modelId": "model-1",
   "pullRequestUrl": "https://github.com/openai/example/pull/12"
 }
 ```
@@ -243,7 +257,7 @@ Manual feature input:
 {
   "inputType": "MANUAL_FEATURES",
   "predictionType": "MERGE_PROBABILITY",
-  "modelId": "merge-probability-v1",
+  "modelId": "model-1",
   "features": {
     "changedFiles": 12,
     "additions": 150,
@@ -267,12 +281,12 @@ Success `200`:
   "modelVersion": "1.0",
   "model": {
     "modelId": "uuid",
-    "code": "merge-probability-v1",
+    "code": "model-1",
     "name": "PR Predictor Demo",
     "taskType": "BOTH",
     "version": "1.0",
     "provider": "local",
-    "description": "A deterministic demo model based on submitted features."
+    "description": "Classifier trained from the included notebook dataset."
   },
   "repository": {
     "owner": "openai",
@@ -347,12 +361,12 @@ Success `200`:
 {
   "totalPredictions": 12,
   "averageMergeProbability": 72.4,
-  "usage": { "used": 2, "limit": 5 },
+  "usage": { "predictionsUsed": 2, "creditsUsed": 2, "creditLimit": 5, "creditsRemaining": 3 },
   "subscription": {
     "subscriptionId": "uuid",
     "status": "ACTIVE",
     "startedAt": "2026-09-30T12:00:00",
-    "plan": { "code": "FREE", "name": "Free", "monthlyPredictionLimit": 5, "description": "5 predictions each month" }
+    "plan": { "code": "FREE", "name": "Free", "monthlyCredits": 5, "description": "5 credits each month" }
   },
   "recentPredictions": []
 }
@@ -408,12 +422,12 @@ Success `200`: all model catalog records, including inactive records retained fo
 [
   {
     "modelId": "uuid",
-    "code": "merge-probability-v1",
+    "code": "model-1",
     "name": "PR Predictor Demo",
     "taskType": "BOTH",
     "version": "1.0",
     "provider": "local",
-    "description": "A deterministic demo model based on submitted features.",
+    "description": "Classifier trained from the included notebook dataset.",
     "active": true,
     "createdAt": "2026-09-30T12:00:00",
     "retiredAt": null
