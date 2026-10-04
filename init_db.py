@@ -1,10 +1,8 @@
 """Create tables and seed the same data used by the FastAPI startup hook."""
 
-from database import Base, SessionLocal, engine
-from app import seed_database
+from app import startup_event
 
 
 if __name__ == "__main__":
-    Base.metadata.create_all(bind=engine)
-    seed_database()
+    startup_event()
     print("Database is ready")
