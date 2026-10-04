@@ -6,7 +6,7 @@
 
 """
 
-from typing import Any, Dict, Optional
+from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -46,12 +46,10 @@ class SubscriptionUpdate(BaseModel):
 
 
 class PredictionRequest(BaseModel):
-    input_type: str = Field(alias="inputType")
-    prediction_type: str = Field(alias="predictionType")
+    pull_request_url: str = Field(min_length=1, alias="pullRequestUrl")
+    prediction_type: str = Field(default="BOTH", alias="predictionType")
     model_id: Optional[str] = Field(default=None, alias="modelId")
-    pull_request_url: Optional[str] = Field(default=None, alias="pullRequestUrl")
-    features: Optional[Dict[str, Any]] = None
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
 
 class ModelCreate(BaseModel):

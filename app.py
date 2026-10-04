@@ -5,9 +5,6 @@ request -> validate -> run notebook model -> persist -> return result.
 """
 
 import os
-import re
-import json
-from urllib.request import Request, urlopen
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -31,6 +28,7 @@ from schemas import (
     SettingsUpdate, SubscriptionUpdate, ModelCreate, ModelUpdate, PlanCreate, PlanUpdate,
 )
 from prediction_engine import predict as run_model_prediction
+from github_api import get_pull_request
 
 
 app = FastAPI(title="PR Predictor API", version="1.0.0")
@@ -46,7 +44,6 @@ ADMIN_DIR = Path(__file__).parent / "admin"
 
 # ! problem
 bearer = HTTPBearer(auto_error=False)
-GITHUB_PR_RE = re.compile(r"^https?://github\.com/([^/]+)/([^/]+)/pull/(\d+)/?$", re.I)
 ALLOWED_PREDICTION_TYPES = {"MERGE_PROBABILITY", "PR_QUALITY", "BOTH"}
 
 
@@ -263,7 +260,7 @@ def get_settings(user: User = Depends(get_current_user), db: Session = Depends(g
 def update_settings(data: SettingsUpdate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     settings = _ensure_settings(db, user)
     values = data.model_dump(exclude_unset=True, by_alias=False)
-    allowed = {"theme_mode": {"LIGHT", "DARK"}, "default_prediction_type": ALLOWED_PREDICTION_TYPES, "default_input_mode": {"GITHUB_URL", "MANUAL_FEATURES"}}
+    allowed = {"theme_mode": {"LIGHT", "DARK"}, "default_prediction_type": ALLOWED_PREDICTION_TYPES, "default_input_mode": {"GITHUB_URL"}}
     for key, value in values.items():
         if key in allowed and value not in allowed[key]:
             raise HTTPException(status_code=400, detail=f"Invalid {key}")
@@ -283,7 +280,7 @@ def _ensure_settings(db: Session, user: User) -> UserSetting:
 
 
 def _settings_dict(settings: UserSetting) -> dict:
-    return {"themeMode": settings.theme_mode, "notificationsEnabled": settings.notifications_enabled, "defaultPredictionType": settings.default_prediction_type, "defaultInputMode": settings.default_input_mode}
+    return {"themeMode": settings.theme_mode, "notificationsEnabled": settings.notifications_enabled, "defaultPredictionType": settings.default_prediction_type, "defaultInputMode": "GITHUB_URL"}
 
 
 #! prediction_type: Optional[str] = Query(default=None, alias="predictionType") query parameter
@@ -374,15 +371,42 @@ def _plan_dict(plan: Plan) -> dict:
 
 
 
-#### todo Pediction Happends Here (Start)
+@app.post("/predict-dev")
+def predict_dev(body: PredictionRequest | str = Body(...)):
+    """Development-only prediction route without auth, plans, credits, or persistence."""
+    request_data = PredictionRequest(pullRequestUrl=body) if isinstance(body, str) else body
+    prediction_type = request_data.prediction_type.upper()
+    if prediction_type not in ALLOWED_PREDICTION_TYPES:
+        raise HTTPException(status_code=400, detail="predictionType must be MERGE_PROBABILITY, PR_QUALITY, or BOTH")
+
+    github_repo, github_pr, features = get_pull_request(request_data.pull_request_url)
+    model_key = request_data.model_id or "model-1"
+    try:
+        merge_score, quality_score, factors = run_model_prediction(features, model_key)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=503, detail="Notebook model is unavailable") from error
+
+    return {
+        "status": "COMPLETED",
+        "predictionType": prediction_type,
+        "modelId": model_key,
+        "repository": {"owner": github_repo["owner"]["login"], "name": github_repo["name"], "url": github_repo["html_url"]},
+        "pullRequest": {"number": github_pr["number"], "url": github_pr["html_url"], "title": github_pr["title"], "state": "MERGED" if github_pr.get("merged") else github_pr["state"].upper(), "authorLogin": (github_pr.get("user") or {}).get("login")},
+        "features": features,
+        "mergeProbability": None if prediction_type == "PR_QUALITY" else merge_score,
+        "qualityScore": None if prediction_type == "MERGE_PROBABILITY" else quality_score,
+        "qualityLabel": _quality_label(quality_score),
+        "recommendation": _recommendation(merge_score, quality_score),
+        "factors": [{"name": item["factor_name"], "description": item["description"], "impact": item["impact"], "order": index} for index, item in enumerate(factors)],
+    }
+
 
 @app.post("/predict")
 def predict(body: PredictionRequest | str = Body(...), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    request_data = _prediction_request(body)
-    input_type = request_data.input_type.upper()
+    request_data = PredictionRequest(pullRequestUrl=body) if isinstance(body, str) else body
     prediction_type = request_data.prediction_type.upper()
-    if input_type not in {"GITHUB_URL", "MANUAL_FEATURES"}:
-        raise HTTPException(status_code=400, detail="inputType must be GITHUB_URL or MANUAL_FEATURES")
     if prediction_type not in ALLOWED_PREDICTION_TYPES:
         raise HTTPException(status_code=400, detail="predictionType must be MERGE_PROBABILITY, PR_QUALITY, or BOTH")
     subscription = _active_subscription(db, user)
@@ -391,46 +415,34 @@ def predict(body: PredictionRequest | str = Body(...), user: User = Depends(get_
     usage = _get_usage(db, user, plan.monthly_credits)
     if usage.credits_used + model.credit_cost > plan.monthly_credits:
         raise HTTPException(status_code=429, detail="Not enough credits for this model")
-    parsed_url = None
-    features: dict[str, Any]
-    raw_feature_text = None
-    if input_type == "GITHUB_URL":
-        if not request_data.pull_request_url:
-            raise HTTPException(status_code=400, detail="pullRequestUrl is required for GITHUB_URL")
-        parsed_url = GITHUB_PR_RE.match(request_data.pull_request_url.strip())
-        if not parsed_url:
-            raise HTTPException(status_code=400, detail="Use a GitHub pull request URL such as https://github.com/owner/repo/pull/12")
-        owner, repo_name, number = parsed_url.groups()
-        features = _github_features(owner, repo_name, number)
-    else:
-        features = request_data.features or {}
-        if not features:
-            raise HTTPException(status_code=400, detail="features must contain at least one value for MANUAL_FEATURES")
-        raw_feature_text = ", ".join(f"{key}={value}" for key, value in features.items())
+    github_repo, github_pr, features = get_pull_request(request_data.pull_request_url)
     try:
         merge_score, quality_score, factors = run_model_prediction(features, model.artifact_key or model.code)
     except Exception as error:
         db.rollback()
         raise HTTPException(status_code=503, detail="Notebook model is unavailable; no credits were charged") from error
-    repository = pull_request = None
-    if parsed_url:
-        owner, repo_name, number = parsed_url.groups()
-        repository = db.query(Repository).filter_by(provider="github", owner=owner, name=repo_name).first()
-        if not repository:
-            repository = Repository(provider="github", owner=owner, name=repo_name, canonical_url=f"https://github.com/{owner}/{repo_name}")
-            db.add(repository)
-            db.flush()
-        pull_request = db.query(PullRequest).filter_by(url=request_data.pull_request_url.strip()).first()
-        if not pull_request:
-            pull_request = PullRequest(repository_id=repository.repository_id, number=int(number), url=request_data.pull_request_url.strip(), title=f"Pull request #{number}", author_login=owner)
-            db.add(pull_request)
-            db.flush()
-    prediction = Prediction(user_id=user.user_id, usage_period_id=usage.usage_period_id, model_id=model.model_id, pull_request_id=pull_request.pull_request_id if pull_request else None, prediction_type=prediction_type, status="COMPLETED", model_version=model.version, credits_cost=model.credit_cost, inference_key=model.artifact_key or model.code, completed_at=datetime.utcnow())
+    owner, repo_name = github_repo["owner"]["login"], github_repo["name"]
+    repository = db.query(Repository).filter(Repository.provider == "github", func.lower(Repository.owner) == owner.lower(), func.lower(Repository.name) == repo_name.lower()).first()
+    if not repository:
+        repository = Repository(provider="github", owner=owner, name=repo_name, canonical_url=github_repo["html_url"])
+        db.add(repository)
+        db.flush()
+    pull_request = db.query(PullRequest).filter_by(repository_id=repository.repository_id, number=github_pr["number"]).first()
+    if not pull_request:
+        pull_request = PullRequest(repository_id=repository.repository_id, number=github_pr["number"])
+        db.add(pull_request)
+    pull_request.url = github_pr["html_url"]
+    pull_request.title = github_pr["title"]
+    pull_request.state = "MERGED" if github_pr.get("merged") else github_pr["state"].upper()
+    pull_request.author_login = (github_pr.get("user") or {}).get("login")
+    pull_request.fetched_at = datetime.utcnow()
+    db.flush()
+    prediction = Prediction(user_id=user.user_id, usage_period_id=usage.usage_period_id, model_id=model.model_id, pull_request_id=pull_request.pull_request_id, prediction_type=prediction_type, status="COMPLETED", model_version=model.version, credits_cost=model.credit_cost, inference_key=model.artifact_key or model.code, completed_at=datetime.utcnow())
     db.add(prediction)
     db.flush()
-    db.add(PredictionInput(prediction_id=prediction.prediction_id, input_mode=input_type, github_url=request_data.pull_request_url if input_type == "GITHUB_URL" else None, raw_feature_text=raw_feature_text))
+    db.add(PredictionInput(prediction_id=prediction.prediction_id, input_mode="GITHUB_URL", github_url=pull_request.url))
     for name, value in features.items():
-        db.add(_feature_row(prediction.prediction_id, name, value, "GITHUB" if input_type == "GITHUB_URL" else "USER"))
+        db.add(_feature_row(prediction.prediction_id, name, value, "GITHUB"))
     show_merge = None if prediction_type == "PR_QUALITY" else merge_score
     show_quality = None if prediction_type == "MERGE_PROBABILITY" else quality_score
     label = _quality_label(quality_score)
@@ -452,17 +464,6 @@ def predict(body: PredictionRequest | str = Body(...), user: User = Depends(get_
     db.commit()
     db.refresh(prediction)
     return _prediction_dict(prediction)
-
-
-def _prediction_request(body: Any) -> PredictionRequest:
-    if isinstance(body, PredictionRequest):
-        return body
-    if isinstance(body, str):
-        return PredictionRequest(inputType="GITHUB_URL", predictionType="BOTH", pullRequestUrl=body)
-    try:
-        return PredictionRequest.model_validate(body)
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail="Prediction body does not match the documented format") from exc
 
 
 def _choose_model(db: Session, model_id: Optional[str], prediction_type: str, plan: Plan) -> MLModel:
@@ -504,41 +505,6 @@ def _feature_row(prediction_id: str, name: str, value: Any, source: str) -> Pred
     return PredictionFeature(prediction_id=prediction_id, feature_name=name, value_type="TEXT", value_text=str(value), source=source)
 
 
-def _github_features(owner, repo, number):
-    """Read actual PR features instead of inventing them from its number."""
-    def fetch(path):
-        headers = {"Accept": "application/vnd.github+json", "User-Agent": "PR-Predictor"}
-        if os.getenv("GITHUB_TOKEN"):
-            headers["Authorization"] = "Bearer " + os.environ["GITHUB_TOKEN"]
-        try:
-            with urlopen(Request("https://api.github.com" + path, headers=headers), timeout=20) as response:
-                return json.load(response)
-        except Exception as error:
-            raise HTTPException(status_code=502, detail="Cannot read GitHub PR; check the URL or GITHUB_TOKEN") from error
-
-    path = f"/repos/{owner}/{repo}"
-    pr = fetch(f"{path}/pulls/{number}")
-    repository = fetch(path)
-    files = []
-    for page in range(1, 31):
-        batch = fetch(f"{path}/pulls/{number}/files?per_page=100&page={page}")
-        files.extend(batch)
-        if len(batch) < 100:
-            break
-    return {
-        "title_word_count": len((pr.get("title") or "").split()),
-        "body_word_count": len((pr.get("body") or "").split()),
-        "total_lines_added": pr["additions"], "total_lines_deleted": pr["deletions"],
-        "total_files_touched": pr["changed_files"], "total_commits": pr["commits"],
-        "files_added": sum(file["status"] == "added" for file in files),
-        "files_modified": sum(file["status"] == "modified" for file in files),
-        "files_deleted": sum(file["status"] == "removed" for file in files),
-        "stars": repository["stargazers_count"], "forks": repository["forks_count"],
-        "language": repository.get("language") or "unknown",
-        "agent": "unknown", "task_type": "unknown",
-    }
-
-
 def _quality_label(score: float) -> str:
     return "Excellent" if score >= 80 else "Good" if score >= 65 else "Needs review" if score >= 50 else "Risky"
 
@@ -550,8 +516,6 @@ def _recommendation(merge_score: float, quality_score: float) -> str:
         return "Review the change size and test coverage before merging."
     return "Add tests and split the change into smaller parts before merging."
 
-
-#### todo Pediction Happends Here (End)
 
 @app.get("/history")
 @app.get("/predictions")
@@ -586,6 +550,7 @@ def _prediction_dict(prediction: Prediction) -> dict:
         "model": _model_dict(prediction.model) if prediction.model else None,
         "repository": {"owner": repository.owner, "name": repository.name, "url": repository.canonical_url} if repository else None,
         "pullRequest": {"number": pr.number, "url": pr.url, "title": pr.title, "state": pr.state, "authorLogin": pr.author_login} if pr else None,
+        "features": {item.feature_name: float(item.value_number) if item.value_type == "NUMBER" else item.value_boolean if item.value_type == "BOOLEAN" else item.value_text for item in prediction.features},
         "mergeProbability": float(result.merge_probability) if result and result.merge_probability is not None else None,
         "qualityScore": float(result.quality_score) if result and result.quality_score is not None else None,
         "qualityLabel": result.quality_label if result else None,

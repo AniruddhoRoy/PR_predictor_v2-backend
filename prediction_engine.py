@@ -109,7 +109,11 @@ def _pipeline(model_name):
     return pipeline
 
 
-def predict(features, model_key):
+def predict(features, model_key="model-1"):
+    # The public prediction helper can be called with a PR URL directly.
+    if isinstance(features, str):
+        from github_api import get_pull_request
+        features = get_pull_request(features)[2]
     row = _row(features)
     model_name = MODEL_NAMES.get((model_key or "model-1").lower())
     if not model_name:
