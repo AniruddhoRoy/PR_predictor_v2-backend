@@ -24,7 +24,7 @@ from models import (
     UsagePeriod, User, UserSetting,
 )
 from schemas import (
-    LoginRequest, PredictionRequest, ProfileUpdate, RegisterRequest,
+    ChangePasswordRequest, LoginRequest, PredictionRequest, ProfileUpdate, RegisterRequest,
     SettingsUpdate, SubscriptionUpdate, ModelCreate, ModelUpdate, PlanCreate, PlanUpdate,
 )
 from prediction_engine import predict as run_model_prediction
@@ -209,6 +209,15 @@ def require_admin(user: User = Depends(get_current_user)) -> User:
     if user.role.upper() != "ADMIN":
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
+
+
+@app.post("/change-password")
+def change_password(data: ChangePasswordRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not verify_password(data.current_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    user.password_hash = hash_password(data.new_password)
+    db.commit()
+    return {"message": "Password changed successfully"}
 
 
 @app.get("/me")
