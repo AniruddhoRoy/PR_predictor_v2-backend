@@ -10,8 +10,10 @@ from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import sessionmaker
 from fastapi.testclient import TestClient
 import app as backend
+import github_api
+from auth import verify_password
 from database import Base
-from models import Plan
+from models import Plan, User
 from prediction_engine import predict, _row
 
 
@@ -49,15 +51,18 @@ class CreditPlansTest(unittest.TestCase):
             self.assertEqual([m.code for m in plan.models], ['model-4'])
 
     def test_access_cost_and_failure(self):
-        body = {'inputType': 'MANUAL_FEATURES', 'predictionType': 'BOTH', 'modelId': 'model-4', 'features': {'additions': 10}}
+        body = {'pullRequestUrl': 'https://github.com/owner/repo/pull/12', 'predictionType': 'BOTH', 'modelId': 'model-4'}
         self.assertEqual(self.client.post('/predict', headers=self.headers, json=body).status_code, 403)
         body['modelId'] = 'model-1'
         model = self.client.get('/models', headers=self.headers).json()[0]
         self.client.patch('/admin/api/models/' + model['modelId'], headers=self.admin, json={'creditCost': 3})
-        with patch.object(backend, 'run_model_prediction', side_effect=RuntimeError('unavailable')):
+        github_data = ({'owner': {'login': 'owner'}, 'name': 'repo', 'html_url': 'https://github.com/owner/repo'},
+                       {'number': 12, 'html_url': body['pullRequestUrl'], 'title': 'Fix login', 'state': 'open'},
+                       {'total_lines_added': 10})
+        with patch.object(backend, 'get_pull_request', return_value=github_data), patch.object(backend, 'run_model_prediction', side_effect=RuntimeError('unavailable')):
             self.assertEqual(self.client.post('/predict', headers=self.headers, json=body).status_code, 503)
         self.assertEqual(self.client.get('/active-plan', headers=self.headers).json()['creditsUsed'], 0)
-        with patch.object(backend, 'run_model_prediction', return_value=(80, 80, [])):
+        with patch.object(backend, 'get_pull_request', return_value=github_data), patch.object(backend, 'run_model_prediction', return_value=(80, 80, [])):
             result = self.client.post('/predict', headers=self.headers, json=body)
             self.assertEqual(result.status_code, 200)
             self.assertEqual(result.json()['creditsCost'], 3)
@@ -85,11 +90,55 @@ class CreditPlansTest(unittest.TestCase):
             {'stargazers_count': 10, 'forks_count': 4, 'language': 'Python'},
             [{'status': 'added'}, {'status': 'modified'}],
         ]
-        with patch.object(backend, 'urlopen', side_effect=[io.BytesIO(json.dumps(item).encode()) for item in responses]):
-            features = backend._github_features('owner', 'repo', '12')
+        with patch.object(github_api, 'urlopen', side_effect=[io.BytesIO(json.dumps(item).encode()) for item in responses]):
+            _, _, features = github_api.get_pull_request('https://github.com/owner/repo/pull/12')
         self.assertEqual(features['total_lines_added'], 12)
         self.assertEqual(features['files_added'], 1)
         self.assertEqual(features['title_word_count'], 2)
+
+
+    def test_change_password_for_user_and_admin(self):
+        for username, headers in [('tester', self.headers), ('admin', self.admin)]:
+            with self.subTest(username=username):
+                response = self.client.post('/change-password', headers=headers, json={'currentPassword': '1234', 'newPassword': 'newpass5678'})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json(), {'message': 'Password changed successfully'})
+                self.assertEqual(self.client.post('/login', json={'username': username, 'password': '1234'}).status_code, 401)
+                self.assertEqual(self.client.post('/login', json={'username': username, 'password': 'newpass5678'}).status_code, 200)
+                self.assertEqual(self.client.get('/me', headers=headers).status_code, 200)
+                with self.sessions() as db:
+                    user = db.query(User).filter_by(username=username).one()
+                    self.assertNotEqual(user.password_hash, 'newpass5678')
+                    self.assertTrue(verify_password('newpass5678', user.password_hash))
+
+    def test_change_password_rejects_wrong_current_password(self):
+        response = self.client.post('/change-password', headers=self.headers, json={'currentPassword': 'wrong', 'newPassword': 'newpass5678'})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {'detail': 'Current password is incorrect'})
+        self.assertEqual(self.client.post('/login', json={'username': 'tester', 'password': '1234'}).status_code, 200)
+
+    def test_change_password_requires_authentication(self):
+        for headers in ({}, {'Authorization': 'Bearer invalid'}):
+            with self.subTest(headers=headers):
+                response = self.client.post('/change-password', headers=headers, json={'currentPassword': '1234', 'newPassword': 'newpass5678'})
+                self.assertEqual(response.status_code, 401)
+
+    def test_change_password_validates_fields(self):
+        bodies = [{}, {'currentPassword': '1234'}, {'newPassword': 'newpass5678'}]
+        bodies += [{'currentPassword': value, 'newPassword': 'newpass5678'} for value in ('', None, 1234, 'x' * 129)]
+        bodies += [{'currentPassword': '1234', 'newPassword': value} for value in ('', 'abc', None, 1234, 'x' * 129)]
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertEqual(self.client.post('/change-password', headers=self.headers, json=body).status_code, 422)
+        self.assertEqual(self.client.post('/login', json={'username': 'tester', 'password': '1234'}).status_code, 200)
+
+    def test_change_password_only_updates_signed_in_account(self):
+        admin_id = self.client.get('/me', headers=self.admin).json()['userId']
+        response = self.client.post('/change-password', headers=self.headers, json={'current_password': '1234', 'new_password': ' new pass ', 'userId': admin_id})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.client.post('/login', json={'username': 'tester', 'password': ' new pass '}).status_code, 200)
+        self.assertEqual(self.client.post('/login', json={'username': 'tester', 'password': 'new pass'}).status_code, 401)
+        self.assertEqual(self.client.post('/login', json={'username': 'admin', 'password': '1234'}).status_code, 200)
 
 
 if __name__ == '__main__':

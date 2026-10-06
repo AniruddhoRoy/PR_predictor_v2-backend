@@ -248,6 +248,53 @@ All fields are optional: fullName (string), email (string), githubProfileUrl (st
 }
 ```
 
+### `POST /change-password`
+
+Authentication: **User** (including admins).
+
+Changes the signed-in account's password after checking its current password. No path or query parameters. Passwords are used exactly as sent, without trimming, and the new password is stored as a hash. Existing bearer tokens remain valid until their usual expiry; this route does not return a new token.
+
+| Field           | Type   | Required | Rules            |
+| --------------- | ------ | -------- | ---------------- |
+| currentPassword | string | Yes      | 1–128 characters |
+| newPassword     | string | Yes      | 4–128 characters |
+
+The snake_case names `current_password` and `new_password` also work. Changing another account's password is not supported. Confirm the new password in the client before sending it.
+
+**Request headers:**
+
+```http
+Content-Type: application/json
+Authorization: Bearer <accessToken>
+```
+
+**Request body:**
+
+```json
+{
+  "currentPassword": "pass1234",
+  "newPassword": "newpass5678"
+}
+```
+
+**Response 200:**
+
+```json
+{
+  "message": "Password changed successfully"
+}
+```
+
+**Response 400** (the current password does not match; no change is saved):
+
+```json
+{
+  "detail": "Current password is incorrect"
+}
+```
+
+Missing/invalid/expired authentication returns 401, for example `{"detail": "Bearer token required"}` when the header is missing. Missing fields, null values, non-string values, or invalid password lengths return 422 with the validation error array described in [Basics and errors](#basics-and-errors). After success, use the new password for future logins; the previous password no longer works.
+
 ### `GET /settings`
 
 Authentication: **User**.
@@ -278,9 +325,9 @@ All fields are optional. Send values, not null.
 | themeMode             | string  | LIGHT, DARK                         |
 | notificationsEnabled  | boolean | true, false                         |
 | defaultPredictionType | string  | MERGE_PROBABILITY, PR_QUALITY, BOTH |
-| defaultInputMode      | string  | GITHUB_URL, MANUAL_FEATURES         |
+| defaultInputMode      | string  | GITHUB_URL                         |
 
-Enums here are case-sensitive. Invalid enum values return 400, such as `Invalid theme_mode`. These are stored preferences only; they are not applied to prediction requests. `/predict` accepts GitHub PR URLs only, so `MANUAL_FEATURES` is a stored value with no effect on predictions.
+Enums here are case-sensitive. Invalid enum values return 400, such as `Invalid theme_mode`. These are stored preferences only; they are not applied to prediction requests. `/predict` accepts GitHub PR URLs only.
 
 **Request body:**
 
@@ -1497,7 +1544,24 @@ No path/query parameters. Latest 100 prediction summaries across all users, newe
 | `GET /redoc`           | Public                           | None         | 200 text/html ReDoc UI                                       |
 | `GET /openapi.json`    | Public                           | None         | 200 application/json generated schema                        |
 
-The admin page signs in through /login and calls /admin/api/\*. When opened through a separate static server (for example VS Code Live Server), its api-base meta tag defaults to http://127.0.0.1:8000. Start the backend before signing in.
+The admin page signs in through /login and calls /admin/api/\*. Its Change password form calls `POST /change-password` for the signed-in admin and checks password confirmation before submitting. When opened through a separate static server (for example VS Code Live Server), its api-base meta tag defaults to http://127.0.0.1:8000. Start the backend before signing in.
+
+All private admin routes have controls in the admin page:
+
+| Method | Route | Frontend control |
+| ------ | ----- | ---------------- |
+| GET | `/admin/api/stats` | Dashboard counts |
+| GET | `/admin/api/users` | Users table |
+| PATCH | `/admin/api/users/{userId}/role` | Role selector and Save |
+| GET | `/admin/api/predictions` | Recent predictions table |
+| GET | `/admin/api/models` | Prediction models table |
+| POST | `/admin/api/models` | New model and Save model |
+| PATCH | `/admin/api/models/{modelId}` | Edit / Activate model |
+| DELETE | `/admin/api/models/{modelId}` | Delete model (deactivate) |
+| GET | `/admin/api/plans` | Plans table |
+| POST | `/admin/api/plans` | New plan and Save plan |
+| PATCH | `/admin/api/plans/{planId}` | Edit / Activate plan |
+| DELETE | `/admin/api/plans/{planId}` | Delete plan (deactivate) |
 
 OpenAPI describes request validation. Many handlers return plain dictionaries without response models, so this document supplies the response examples.
 

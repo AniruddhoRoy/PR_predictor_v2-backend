@@ -16,6 +16,17 @@
     </section>
     <section id="dashboard" class="hidden">
       <div id="stats" class="stats"></div>
+      <section class="card">
+        <h2>Change password</h2>
+        <form id="password-form">
+          <div class="model-form-grid">
+            <label>Current password<input id="current-password" type="password" autocomplete="current-password" minlength="1" maxlength="128" required></label>
+            <label>New password<input id="new-password" type="password" autocomplete="new-password" minlength="4" maxlength="128" required></label>
+            <label>Confirm new password<input id="confirm-password" type="password" autocomplete="new-password" minlength="4" maxlength="128" required></label>
+          </div>
+          <div class="form-actions"><button type="submit">Change password</button><p id="password-message" aria-live="polite"></p></div>
+        </form>
+      </section>
       <div class="grid">
         <section class="card"><div class="section-head"><h2>Users</h2><button id="refresh" class="secondary" type="button">Refresh</button></div><div class="table-wrap"><table><thead><tr><th>Username</th><th>Name</th><th>Email</th><th>Role</th><th></th></tr></thead><tbody id="users"></tbody></table></div></section>
         <section class="card"><h2>Recent predictions</h2><div class="table-wrap"><table><thead><tr><th>User</th><th>Type</th><th>Status</th><th>Created</th></tr></thead><tbody id="predictions"></tbody></table></div></section>

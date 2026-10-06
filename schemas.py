@@ -25,6 +25,12 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128, alias="currentPassword")
+    new_password: str = Field(min_length=4, max_length=128, alias="newPassword")
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class ProfileUpdate(BaseModel):
     full_name: Optional[str] = Field(default=None, alias="fullName")
     email: Optional[str] = None #! this is equivalent to upper one
