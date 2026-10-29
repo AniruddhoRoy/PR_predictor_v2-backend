@@ -18,14 +18,17 @@ class AnalysisApiTest(unittest.TestCase):
         self.addCleanup(self.env.stop)
 
     def test_posts_only_url_with_server_token(self):
-        with patch.object(analysis_api, 'urlopen', return_value=io.BytesIO(json.dumps(ANALYSIS).encode())) as send:
+        response_body = deepcopy(ANALYSIS)
+        response_body['pr_url'] += '/'
+        response_body['service_metadata'] = {'extra': [1, None, False]}
+        with patch.object(analysis_api, 'urlopen', return_value=io.BytesIO(json.dumps(response_body).encode())) as send:
             result = analysis_api.analyze_pr(ANALYSIS['pr_url'])
         request = send.call_args.args[0]
         self.assertEqual(request.full_url, analysis_api.ANALYZE_URL)
         self.assertEqual(request.method, 'POST')
         self.assertEqual(request.get_header('Authorization'), 'Bearer test-only-token')
         self.assertEqual(json.loads(request.data), {'pr_url': ANALYSIS['pr_url']})
-        self.assertEqual(result, ANALYSIS)
+        self.assertEqual(result, response_body)
 
     def test_missing_token_and_bad_url_do_not_make_requests(self):
         with patch.object(analysis_api, 'urlopen') as send:

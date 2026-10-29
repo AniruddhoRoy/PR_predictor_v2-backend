@@ -20,7 +20,7 @@ This reference follows `app.py`, `schemas.py`, and `analysis_api.py`. It include
 
 ## Basics and errors
 
-Send bodies with `Content-Type: application/json`. Responses are JSON except browser pages and assets. Use camelCase fields as shown; Pydantic request models also accept their snake_case Python field names. Extra Pydantic request fields are ignored, not applied to database records, with one exception: `POST /predict` and `POST /predict-dev` reject unknown fields (see [Predictions and history](#predictions-and-history)).
+Send bodies with `Content-Type: application/json`. Responses are JSON except browser pages and assets. Most routes use camelCase fields as shown; prediction success responses preserve the analyzer's original fields (including snake_case). Pydantic request models also accept their snake_case Python field names. Extra Pydantic request fields are ignored, not applied to database records, with one exception: `POST /predict` and `POST /predict-dev` reject unknown fields (see [Predictions and history](#predictions-and-history)).
 
 | Authentication label | Required header                       | Access                                       |
 | -------------------- | ------------------------------------- | -------------------------------------------- |
@@ -37,7 +37,9 @@ For PATCH, omit unchanged fields. Optional does not mean every field safely acce
 Application errors have a string detail:
 
 ```json
-{ "detail": "Not enough credits for this model" }
+{
+  "detail": "Not enough credits for this model"
+}
 ```
 
 Validation errors normally have an array detail, for example a missing login password:
@@ -47,9 +49,14 @@ Validation errors normally have an array detail, for example a missing login pas
   "detail": [
     {
       "type": "missing",
-      "loc": ["body", "password"],
+      "loc": [
+        "body",
+        "password"
+      ],
       "msg": "Field required",
-      "input": { "username": "sam" }
+      "input": {
+        "username": "sam"
+      }
     }
   ]
 }
@@ -65,9 +72,9 @@ Exact validation fields can vary with FastAPI/Pydantic versions. Handle both det
 | 401    | Missing/invalid/expired token, deleted account, or incorrect login                                                              |
 | 403    | Admin access required, or selected prediction model inaccessible/incompatible                                                   |
 | 404    | Record, model, plan, or GitHub PR/repository not found                                                                          |
-| 409    | Duplicate account/code or inheritance cycle                                                                                     |
+| 409    | Duplicate account/code or subscription changed during analysis                                                                                     |
 | 422 | Missing/invalid input or the analyzer rejected the request/PR URL |
-| 429 | Not enough monthly credits |
+| 429 | Not enough plan credits |
 | 502 | Analysis service connection error or invalid response |
 | 503 | Missing service token, service configuration/quota issue, or service unavailable |
 | 504 | GitHub, Gemini, or the analysis service timed out |
@@ -356,22 +363,18 @@ Enums here are case-sensitive. Invalid enum values return 400, such as `Invalid 
 
 Each successful prediction deducts the selected model's creditCost once, including BOTH requests. The prediction's creditsCost stores that charge. Validation and analysis-service failures do not consume credits.
 
-Usage is per user/calendar month, using the server's local date. Each month starts a new usage period; credits do not roll over. Switching plans changes the limit but preserves that month's creditsUsed. Remaining credits are max(0, monthlyCredits - creditsUsed). Admin edits apply to subsequent requests and survive startup.
+Each subscription has `credits` and a `duration` in days. `endedAt` is `startedAt + duration` days (UTC). Usage belongs to that subscription. Switching plans carries creditsUsed into the new subscription; selecting the same active plan does not restart it. Expired or inactive subscriptions fall back to a fresh FREE subscription. Credits do not roll over after expiry. Remaining credits are max(0, credits - creditsUsed).
 
-Plans inherit parent models recursively and add their own direct models, with duplicates removed. Credits are the plan's own allowance; parent credits are not added.
+Plans list their models directly. New installations seed these defaults; existing plans and admin edits are preserved:
 
-Default values (admins may change them):
+| Plan | Credits | Duration (days) | Models |
+| --- | --- | --- | --- |
+| FREE | 5 | 1 | model-1 |
+| PLUS | 30 | 30 | models 1�3 |
+| PRO | 100 | 30 | models 1�6 |
+| ULTRA | 300 | 30 | models 1�6 |
 
-| Plan  | Monthly credits | Parent | Direct models             | Effective models |
-| ----- | --------------- | ------ | ------------------------- | ---------------- |
-| FREE  | 5               | None   | model-1                   | model-1          |
-| PLUS  | 30              | None   | model-1, model-2, model-3 | models 1–3       |
-| PRO   | 100             | PLUS   | model-4, model-5, model-6 | models 1–6       |
-| ULTRA | 300             | PRO    | None                      | models 1–6       |
-
-Models `model-1` through `model-6` are catalog entries used for plan access and credit cost. Every entry calls the same hosted analyzer; the service accepts only a PR URL, not a classifier selector. Seeded entries have taskType BOTH and creditCost 1.
-
-Model response fields: modelId (UUID), code/name (strings), taskType (supported request type), version (catalog metadata), provider/description (nullable strings), creditCost (positive integer), artifactKey (legacy nullable metadata, ignored for inference).
+All six catalog entries use the same hosted analyzer and start with creditCost 1. Model response fields are modelId, code, name, version, provider, description, and creditCost. Plan responses use credits and duration. Parent plans, monthlyCredits, taskType, and artifactKey have been removed. Credits and model edits apply on subsequent requests; duration edits apply when a new subscription starts.
 
 ### `GET /models`
 
@@ -379,7 +382,7 @@ Authentication: **User**.
 
 Returns active models accessible through the current plan, sorted by name.
 
-Optional query: predictionType (string), intended values MERGE_PROBABILITY, PR_QUALITY, BOTH; uppercased. Models match if taskType is BOTH or equals the filter. BOTH requests only select BOTH models. Unknown filter values are not rejected here and may still return BOTH models. Omit the query for all active models in the plan.
+Optional query: predictionType (MERGE_PROBABILITY, PR_QUALITY, or BOTH; uppercased). All catalog models support all three values. An unsupported value returns 400. Omit the query to list all active models in the plan.
 
 **Request body:** none.
 
@@ -391,12 +394,10 @@ Optional query: predictionType (string), intended values MERGE_PROBABILITY, PR_Q
     "modelId": "<modelId>",
     "code": "model-1",
     "name": "Model 1",
-    "taskType": "BOTH",
     "version": "1.0",
     "provider": "gemini-api",
     "description": "Hosted Gemini PR analysis.",
-    "creditCost": 1,
-    "artifactKey": null
+    "creditCost": 1
   }
 ]
 ```
@@ -405,7 +406,7 @@ Optional query: predictionType (string), intended values MERGE_PROBABILITY, PR_Q
 
 Authentication: **User**.
 
-No query parameters. Active plans ordered by monthlyCredits. The example shows the first plan; the default database returns four.
+No query parameters. Active plans ordered by credits. The example shows the first plan; the default database returns four.
 
 **Request body:** none.
 
@@ -417,22 +418,20 @@ No query parameters. Active plans ordered by monthlyCredits. The example shows t
     "planId": "<planId>",
     "code": "FREE",
     "name": "Free",
-    "monthlyCredits": 5,
-    "description": "5 credits each month",
-    "parentPlanCode": null,
+    "description": "5 credits per plan period",
     "models": [
       {
         "modelId": "<modelId>",
         "code": "model-1",
         "name": "Model 1",
-        "taskType": "BOTH",
         "version": "1.0",
         "provider": "gemini-api",
         "description": "Hosted Gemini PR analysis.",
-        "creditCost": 1,
-        "artifactKey": null
+        "creditCost": 1
       }
-    ]
+    ],
+    "credits": 5,
+    "duration": 1
   }
 ]
 ```
@@ -441,7 +440,7 @@ No query parameters. Active plans ordered by monthlyCredits. The example shows t
 
 Authentication: **User**.
 
-No path/query parameters. Returns the current ACTIVE subscription; creates a FREE subscription if none exists. Fields: subscriptionId, status, startedAt, and the complete plan. Usage is available from /active-plan or /dashboard.
+No path/query parameters. Returns the current ACTIVE subscription; creates a FREE subscription if none exists or it has expired. Fields: subscriptionId, status, startedAt, endedAt, and the complete plan. Usage is available from /active-plan or /dashboard.
 
 **Request body:** none.
 
@@ -456,23 +455,22 @@ No path/query parameters. Returns the current ACTIVE subscription; creates a FRE
     "planId": "<planId>",
     "code": "FREE",
     "name": "Free",
-    "monthlyCredits": 5,
-    "description": "5 credits each month",
-    "parentPlanCode": null,
+    "description": "5 credits per plan period",
     "models": [
       {
         "modelId": "<modelId>",
         "code": "model-1",
         "name": "Model 1",
-        "taskType": "BOTH",
         "version": "1.0",
         "provider": "gemini-api",
         "description": "Hosted Gemini PR analysis.",
-        "creditCost": 1,
-        "artifactKey": null
+        "creditCost": 1
       }
-    ]
-  }
+    ],
+    "credits": 5,
+    "duration": 1
+  },
+  "endedAt": "2026-10-05T12:00:00"
 }
 ```
 
@@ -491,24 +489,22 @@ No path/query parameters. Current plan plus creditsUsed and creditsRemaining. `G
   "planId": "<planId>",
   "code": "FREE",
   "name": "Free",
-  "monthlyCredits": 5,
-  "description": "5 credits each month",
-  "parentPlanCode": null,
+  "description": "5 credits per plan period",
   "models": [
     {
       "modelId": "<modelId>",
       "code": "model-1",
       "name": "Model 1",
-      "taskType": "BOTH",
       "version": "1.0",
       "provider": "gemini-api",
       "description": "Hosted Gemini PR analysis.",
-      "creditCost": 1,
-      "artifactKey": null
+      "creditCost": 1
     }
   ],
   "creditsUsed": 0,
-  "creditsRemaining": 5
+  "creditsRemaining": 5,
+  "credits": 5,
+  "duration": 1
 }
 ```
 
@@ -516,7 +512,7 @@ No path/query parameters. Current plan plus creditsUsed and creditsRemaining. `G
 
 Authentication: **User**.
 
-Required planCode (string): an existing active plan code, uppercased by the route; avoid spaces. Accepts FREE, PLUS, PRO, ULTRA, or an active admin-created code. Cancels existing ACTIVE subscriptions and creates a new one. Monthly usage is retained even if selecting the same plan again. No payment is processed. Unknown/inactive plan returns 404: `Plan not found`. This example reselects FREE.
+Required planCode (string): an existing active plan code, uppercased by the route; avoid spaces. Accepts FREE, PLUS, PRO, ULTRA, or an active admin-created code. Cancels the current ACTIVE subscription and creates a new one with the selected duration, carrying spent credits forward. Selecting the same active plan returns the existing subscription. No payment is processed. Unknown/inactive plan returns 404: `Plan not found`. This example reselects FREE.
 
 **Request body:**
 
@@ -537,23 +533,22 @@ Required planCode (string): an existing active plan code, uppercased by the rout
     "planId": "<planId>",
     "code": "FREE",
     "name": "Free",
-    "monthlyCredits": 5,
-    "description": "5 credits each month",
-    "parentPlanCode": null,
+    "description": "5 credits per plan period",
     "models": [
       {
         "modelId": "<modelId>",
         "code": "model-1",
         "name": "Model 1",
-        "taskType": "BOTH",
         "version": "1.0",
         "provider": "gemini-api",
         "description": "Hosted Gemini PR analysis.",
-        "creditCost": 1,
-        "artifactKey": null
+        "creditCost": 1
       }
-    ]
-  }
+    ],
+    "credits": 5,
+    "duration": 1
+  },
+  "endedAt": "2026-10-05T12:00:00"
 }
 ```
 
@@ -583,38 +578,26 @@ Authentication: **User**. No path/query parameters. The request is synchronous. 
 
 A JSON string URL is also accepted: `"https://github.com/owner/repo/pull/12"`. Unknown body fields are rejected with 422. An active model outside the plan or incompatible with the requested type returns 403; missing/inactive models return 404.
 
-**Response 200:**
+**Response 200:** the complete JSON object returned by `/analyze`, unchanged. Both prediction routes return the same structure. For example:
 
 ```json
 {
-  "predictionId": "<predictionId>",
-  "status": "COMPLETED",
-  "predictionType": "BOTH",
-  "createdAt": "2026-10-28T12:00:00",
-  "completedAt": "2026-10-28T12:00:00",
-  "modelVersion": "1.0",
-  "creditsCost": 1,
-  "inferenceKey": "gemini-api",
-  "model": {
-    "modelId": "<modelId>", "code": "model-1", "name": "Model 1",
-    "taskType": "BOTH", "version": "1.0", "provider": "gemini-api",
-    "description": "Hosted Gemini PR analysis.", "creditCost": 1, "artifactKey": null
-  },
-  "repository": { "owner": "owner", "name": "repo", "url": "https://github.com/owner/repo" },
-  "pullRequest": {
-    "number": 12, "url": "https://github.com/owner/repo/pull/12",
-    "title": "Fix login", "state": "OPEN", "authorLogin": "sam"
-  },
+  "pr_url": "https://github.com/owner/repo/pull/12",
   "features": {
-    "repository": "owner/repo", "number": 12, "title": "Fix login",
-    "state": "open", "author": "sam", "merged": false,
-    "files": [{ "filename": "app.py", "patch": "+fix" }], "warnings": []
+    "repository": "owner/repo",
+    "number": 12,
+    "title": "Fix login",
+    "state": "open",
+    "author": "sam",
+    "merged": false,
+    "files": [
+      {
+        "filename": "app.py",
+        "patch": "+fix"
+      }
+    ],
+    "warnings": []
   },
-  "mergeProbability": 95,
-  "qualityScore": 92,
-  "qualityLabel": "excellent",
-  "recommendation": "Fixes login.",
-  "factors": [],
   "analysis": {
     "merge_probability": 95,
     "quality_score": 92,
@@ -622,17 +605,26 @@ A JSON string URL is also accepted: `"https://github.com/owner/repo/pull/12"`. U
     "confidence": "high",
     "summary": "Fixes login.",
     "merge_reasoning": "Small tested fix.",
-    "recommendations": { "excellent": ["Tests included"], "good": [], "bad": [], "worst": [] },
+    "recommendations": {
+      "excellent": [
+        "Tests included"
+      ],
+      "good": [],
+      "bad": [],
+      "worst": []
+    },
     "potential_improvements": [],
-    "limitations": ["No CI results"]
+    "limitations": [
+      "No CI results"
+    ]
   },
-  "probabilityNote": "AI estimate, not a calibrated probability or a guarantee."
+  "probability_note": "AI estimate, not a calibrated probability or a guarantee."
 }
 ```
 
-`features` is the service's full object; fields can include PR text, files/patches, comments, reviews, commits, checks, statuses, and warnings. These nested objects are preserved as JSON. `analysis` preserves the complete service analysis, including grouped recommendations, improvements, limitations, and confidence.
+All service fields are returned, including any extra top-level fields and nested features, files/patches, comments, reviews, commits, checks, statuses, warnings, recommendations, improvements, limitations, and confidence. Field names and values are not renamed, filtered, or supplemented with local metadata.
 
-Top-level `mergeProbability` and `qualityScore` come from separate service scores. MERGE_PROBABILITY returns `qualityScore: null`; PR_QUALITY returns `mergeProbability: null`. The complete analysis still contains both scores. `qualityLabel` uses the service's quality label; `recommendation` is its summary. New predictions have `factors: []` because this backend no longer generates local explanations.
+`predictionType` still controls local model eligibility and the score columns saved for history, but does not filter the returned JSON: both analyzer scores are returned for every prediction type. Read the scores from `analysis.merge_probability` and `analysis.quality_score`. The response does not add `predictionId`, `creditsCost`, or other local fields; use `/history` for saved IDs and `/active-plan` for the remaining credits.
 
 **Errors (no credits charged):**
 
@@ -650,19 +642,99 @@ Top-level `mergeProbability` and `qualityScore` come from separate service score
 
 ### `POST /predict-dev`
 
-Authentication: **Public**. Same input as POST /predict. This route calls the same external service but does not check plan access, charge credits, or save history. modelId is echoed only.
+Authentication: **Public**. Same input as POST /predict. This route calls the same external service but does not check plan access, charge credits, or save history. modelId does not select an external classifier.
 
-**Response 200:** `status`, `predictionType`, `modelId` (null if omitted), `repository`, `pullRequest`, `features`, `mergeProbability`, `qualityScore`, `qualityLabel`, `recommendation`, `factors`, `analysis`, and `probabilityNote`, using the same values/shapes as the prediction example above. No predictionId, timestamps, model, modelVersion, creditsCost, or inferenceKey. It can return the same service errors, but not local login/plan/credit errors.
+**Response 200:** exactly the complete analyzer JSON shown under POST /predict, including every additional service field. No wrapper or local fields are added. It can return the same service errors, but not local login/plan/credit errors.
 
 ### `GET /history` and `GET /predictions`
 
 Authentication: **User**. Request body: none. Query: optional `search` (matches stored PR URL/title), `limit` (integer 1–100, default 20).
 
-**Response 200:** an array of complete POST /predict response objects for the current user, newest first. Empty history is `[]`. The saved full analysis and features are returned without calling the service again. Older entries keep their stored scores/features/factors and may not contain analysis or probabilityNote.
+**Response 200:** an array of local history records for the current user, newest first. Empty history is `[]`. Each item retains local metadata and the existing history format below; it is different from the raw POST /predict response. Reading history does not call the service again. Older entries may not contain analysis or probabilityNote.
+
+One history item:
+
+```json
+{
+  "predictionId": "<predictionId>",
+  "status": "COMPLETED",
+  "predictionType": "BOTH",
+  "createdAt": "2026-10-28T12:00:00",
+  "completedAt": "2026-10-28T12:00:00",
+  "modelVersion": "1.0",
+  "creditsCost": 1,
+  "inferenceKey": "gemini-api",
+  "model": {
+    "modelId": "<modelId>",
+    "code": "model-1",
+    "name": "Model 1",
+    "version": "1.0",
+    "provider": "gemini-api",
+    "description": "Hosted Gemini PR analysis.",
+    "creditCost": 1
+  },
+  "repository": {
+    "owner": "owner",
+    "name": "repo",
+    "url": "https://github.com/owner/repo"
+  },
+  "pullRequest": {
+    "number": 12,
+    "url": "https://github.com/owner/repo/pull/12",
+    "title": "Fix login",
+    "state": "OPEN",
+    "authorLogin": "sam"
+  },
+  "features": {
+    "repository": "owner/repo",
+    "number": 12,
+    "title": "Fix login",
+    "state": "open",
+    "author": "sam",
+    "merged": false,
+    "files": [
+      {
+        "filename": "app.py",
+        "patch": "+fix"
+      }
+    ],
+    "warnings": []
+  },
+  "mergeProbability": 95,
+  "qualityScore": 92,
+  "qualityLabel": "excellent",
+  "recommendation": "Fixes login.",
+  "analysis": {
+    "merge_probability": 95,
+    "quality_score": 92,
+    "quality": "excellent",
+    "confidence": "high",
+    "summary": "Fixes login.",
+    "merge_reasoning": "Small tested fix.",
+    "recommendations": {
+      "excellent": [
+        "Tests included"
+      ],
+      "good": [],
+      "bad": [],
+      "worst": []
+    },
+    "potential_improvements": [],
+    "limitations": [
+      "No CI results"
+    ]
+  },
+  "probabilityNote": "AI estimate, not a calibrated probability or a guarantee.",
+  "pr_url": "https://github.com/owner/repo/pull/12",
+  "title": "Fix login"
+}
+```
+
+For history records, MERGE_PROBABILITY has `qualityScore: null` and PR_QUALITY has `mergeProbability: null`; the saved `analysis` still contains both scores. `predictionId` is the local ID used by the detail route.
 
 ### `GET /predictions/{predictionId}`
 
-Authentication: **User**. Required path: predictionId, the UUID returned from POST /predict. No body/query. **Response 200:** one complete POST /predict response object. Unknown IDs or another user's prediction return 404.
+Authentication: **User**. Required path: predictionId, the UUID returned by GET /history. No body/query. **Response 200:** one local history record in the shape shown above. Unknown IDs or another user's prediction return 404.
 
 ### `GET /dashboard`
 
@@ -674,24 +746,42 @@ Authentication: **User**. No body/path/query input.
 {
   "totalPredictions": 0,
   "averageMergeProbability": null,
-  "usage": { "predictionsUsed": 0, "creditsUsed": 0, "creditLimit": 5, "creditsRemaining": 5 },
+  "usage": {
+    "predictionsUsed": 0,
+    "creditsUsed": 0,
+    "creditLimit": 5,
+    "creditsRemaining": 5
+  },
   "subscription": {
-    "subscriptionId": "<subscriptionId>", "status": "ACTIVE", "startedAt": "2026-10-28T12:00:00",
+    "subscriptionId": "<subscriptionId>",
+    "status": "ACTIVE",
+    "startedAt": "2026-10-28T12:00:00",
     "plan": {
-      "planId": "<planId>", "code": "FREE", "name": "Free", "monthlyCredits": 5,
-      "description": "5 credits each month", "parentPlanCode": null,
-      "models": [{
-        "modelId": "<modelId>", "code": "model-1", "name": "Model 1",
-        "taskType": "BOTH", "version": "1.0", "provider": "gemini-api",
-        "description": "Hosted Gemini PR analysis.", "creditCost": 1, "artifactKey": null
-      }]
-    }
+      "planId": "<planId>",
+      "code": "FREE",
+      "name": "Free",
+      "description": "5 credits per plan period",
+      "models": [
+        {
+          "modelId": "<modelId>",
+          "code": "model-1",
+          "name": "Model 1",
+          "version": "1.0",
+          "provider": "gemini-api",
+          "description": "Hosted Gemini PR analysis.",
+          "creditCost": 1
+        }
+      ],
+      "credits": 5,
+      "duration": 1
+    },
+    "endedAt": "2026-10-29T12:00:00"
   },
   "recentPredictions": []
 }
 ```
 
-Counts saved predictions, averages stored non-null mergeProbability values, and returns up to five complete prediction objects in recentPredictions. The average is null with no scored entries. Usage is for the current calendar month.
+Counts saved predictions, averages stored non-null mergeProbability values, and returns up to five complete prediction objects in recentPredictions. The average is null with no scored entries. Usage is for the current subscription. predictionsUsed counts its saved predictions; creditsUsed also includes credits carried over when changing plans.
 
 ## Private admin routes
 
@@ -699,41 +789,39 @@ Log in through /login with an admin account. The seeded username is admin; its i
 
 ### Model write fields
 
-POST requires code, name, taskType, version. PATCH accepts the same fields, all optional.
+POST requires code, name, version. PATCH accepts the same fields, all optional.
 
 | Field       | Type           | Create default / rules                                            |
 | ----------- | -------------- | ----------------------------------------------------------------- |
 | code        | string         | Required; 2–80 characters; trimmed/lowercased, unique             |
 | name        | string         | Required; 1–150 characters; trimmed, not blank                    |
-| taskType    | string         | Required; BOTH, MERGE_PROBABILITY, PR_QUALITY; trimmed/uppercased |
 | version     | string         | Required; 1–80 characters; trimmed, not blank                     |
 | provider    | string or null | null                                                              |
 | description | string or null | null                                                              |
 | creditCost  | integer        | 1; range 1–100000                                                 |
-| artifactKey | string or null | Defaults to code if absent/null/empty on create                   |
 | active      | boolean        | true                                                              |
 
-artifactKey is retained for compatibility only and is ignored by the hosted analyzer. No classifier selection or training occurs. provider/description can be cleared with null. Omit other nonnullable fields or provide a valid value, not null.
+No classifier selection or training occurs. provider defaults to local and must be a string. description can be cleared with null. Omit other nonnullable fields or provide a valid value, not null.
 
 Admin model responses extend public model objects with active (boolean), createdAt (timestamp), and retiredAt (timestamp or null). Deactivation sets retiredAt; reactivation clears it.
 
 ### Plan write fields
 
-POST requires code, name, monthlyCredits. PATCH accepts the same fields, all optional.
+POST requires code and name; credits defaults to 5 and duration defaults to 1 day. PATCH accepts the same fields, all optional.
 
 | Field          | Type             | Create default / rules                                           |
 | -------------- | ---------------- | ---------------------------------------------------------------- |
 | code           | string           | Required; 2–80 characters; trimmed/uppercased, unique            |
 | name           | string           | Required; 1–150 characters; trimmed, not blank                   |
-| monthlyCredits | integer          | Required; range 0–1000000000                                     |
-| parentPlanCode | string or null   | null; existing plan code, trimmed/uppercased                     |
+| credits | integer | Default 5; range 0�1000000000 |
+| duration | integer | Default 1; range 1�36500 days |
 | modelCodes     | array of strings | []; existing model codes, trimmed/lowercased; duplicates removed |
 | description    | string or null   | Empty string if absent/null on create                            |
 | active         | boolean          | true                                                             |
 
-modelCodes replaces the direct list; it does not append. On PATCH, [] or null clears direct models. Null/empty parentPlanCode clears inheritance. Omit other fields to keep them; use an empty description string to clear it on PATCH.
+modelCodes replaces the assigned list; it does not append. On PATCH, [] or null clears models. Omit other fields to keep them; use an empty description string to clear it on PATCH.
 
-Admin plan responses extend public plans with active and directModels. directModels contains explicitly assigned public model objects; models contains the combined inherited/direct objects. An inactive parent still contributes models. Actual model activity is enforced by /models and /predict.
+Admin plan responses extend public plans with active. models contains the assigned model objects. Actual model activity is enforced by /models and /predict.
 
 ### `GET /admin/api/stats`
 
@@ -770,12 +858,10 @@ No path/query parameters. All catalog models including inactive records, active 
     "modelId": "<modelId>",
     "code": "model-1",
     "name": "Model 1",
-    "taskType": "BOTH",
     "version": "1.0",
     "provider": "gemini-api",
     "description": "Hosted Gemini PR analysis.",
     "creditCost": 1,
-    "artifactKey": null,
     "active": true,
     "createdAt": "2026-10-04T12:00:00",
     "retiredAt": null
@@ -787,7 +873,7 @@ No path/query parameters. All catalog models including inactive records, active 
 
 Authentication: **Admin**.
 
-Creates a catalog record using the model write fields above. Assign it to a plan before users can select it. Duplicate code: 409. Blank code/name/version or invalid taskType: 400. Invalid schema length/range: 422.
+Creates a catalog record using the model write fields above. Assign it to a plan before users can select it. Duplicate code: 409. Blank code/name/version: 400. Invalid schema length/range: 422.
 
 **Request body:**
 
@@ -795,12 +881,10 @@ Creates a catalog record using the model write fields above. Assign it to a plan
 {
   "code": "student-model",
   "name": "Student Model",
-  "taskType": "BOTH",
   "version": "1.0",
   "provider": "gemini-api",
-  "description": "Logistic regression for the student plan.",
+  "description": "Hosted PR analysis for the student plan.",
   "creditCost": 2,
-  "artifactKey": null,
   "active": true
 }
 ```
@@ -812,12 +896,10 @@ Creates a catalog record using the model write fields above. Assign it to a plan
   "modelId": "<modelId>",
   "code": "student-model",
   "name": "Student Model",
-  "taskType": "BOTH",
   "version": "1.0",
   "provider": "gemini-api",
-  "description": "Logistic regression for the student plan.",
+  "description": "Hosted PR analysis for the student plan.",
   "creditCost": 2,
-  "artifactKey": null,
   "active": true,
   "createdAt": "2026-10-04T12:00:00",
   "retiredAt": null
@@ -828,7 +910,7 @@ Creates a catalog record using the model write fields above. Assign it to a plan
 
 Authentication: **Admin**.
 
-Required path modelId: database UUID, not model code. Changes only included fields. Unknown ID: 404. Duplicate code: 409. Blank code/name/version or invalid taskType: 400. Cost changes apply to future predictions; past creditsCost stays unchanged.
+Required path modelId: database UUID, not model code. Changes only included fields. Unknown ID: 404. Duplicate code: 409. Blank code/name/version: 400. Cost changes apply to future predictions; past creditsCost stays unchanged.
 
 **Request body:**
 
@@ -847,12 +929,10 @@ Required path modelId: database UUID, not model code. Changes only included fiel
   "modelId": "<modelId>",
   "code": "student-model",
   "name": "Student Model Updated",
-  "taskType": "BOTH",
   "version": "1.0",
   "provider": "gemini-api",
-  "description": "Logistic regression for the student plan.",
+  "description": "Hosted PR analysis for the student plan.",
   "creditCost": 3,
-  "artifactKey": null,
   "active": true,
   "createdAt": "2026-10-04T12:00:00",
   "retiredAt": null
@@ -876,12 +956,10 @@ Required path modelId: database UUID. No query parameters. Deactivates the model
     "modelId": "<modelId>",
     "code": "student-model",
     "name": "Student Model Updated",
-    "taskType": "BOTH",
     "version": "1.0",
     "provider": "gemini-api",
-    "description": "Logistic regression for the student plan.",
+    "description": "Hosted PR analysis for the student plan.",
     "creditCost": 3,
-    "artifactKey": null,
     "active": false,
     "createdAt": "2026-10-04T12:00:00",
     "retiredAt": "2026-10-04T12:00:00"
@@ -893,7 +971,7 @@ Required path modelId: database UUID. No query parameters. Deactivates the model
 
 Authentication: **Admin**.
 
-No path/query parameters. All plans, including inactive ones, ordered by monthlyCredits.
+No path/query parameters. All plans, including inactive ones, ordered by credits.
 
 **Request body:** none.
 
@@ -905,36 +983,21 @@ No path/query parameters. All plans, including inactive ones, ordered by monthly
     "planId": "<planId>",
     "code": "FREE",
     "name": "Free",
-    "monthlyCredits": 5,
-    "description": "5 credits each month",
+    "description": "5 credits per plan period",
     "active": true,
-    "parentPlanCode": null,
-    "directModels": [
-      {
-        "modelId": "<modelId>",
-        "code": "model-1",
-        "name": "Model 1",
-        "taskType": "BOTH",
-        "version": "1.0",
-        "provider": "gemini-api",
-        "description": "Hosted Gemini PR analysis.",
-        "creditCost": 1,
-        "artifactKey": null
-      }
-    ],
     "models": [
       {
         "modelId": "<modelId>",
         "code": "model-1",
         "name": "Model 1",
-        "taskType": "BOTH",
         "version": "1.0",
         "provider": "gemini-api",
         "description": "Hosted Gemini PR analysis.",
-        "creditCost": 1,
-        "artifactKey": null
+        "creditCost": 1
       }
-    ]
+    ],
+    "credits": 5,
+    "duration": 1
   }
 ]
 ```
@@ -951,11 +1014,13 @@ Creates a plan using the plan write fields above. Duplicate code: 409. Unknown p
 {
   "code": "STUDENT",
   "name": "Student",
-  "monthlyCredits": 20,
-  "parentPlanCode": null,
-  "modelCodes": ["model-1"],
-  "description": "20 credits each month",
-  "active": true
+  "modelCodes": [
+    "model-1"
+  ],
+  "description": "20 credits per plan period",
+  "active": true,
+  "credits": 20,
+  "duration": 30
 }
 ```
 
@@ -966,36 +1031,21 @@ Creates a plan using the plan write fields above. Duplicate code: 409. Unknown p
   "planId": "<planId>",
   "code": "STUDENT",
   "name": "Student",
-  "monthlyCredits": 20,
-  "description": "20 credits each month",
+  "description": "20 credits per plan period",
   "active": true,
-  "parentPlanCode": null,
-  "directModels": [
-    {
-      "modelId": "<modelId>",
-      "code": "model-1",
-      "name": "Model 1",
-      "taskType": "BOTH",
-      "version": "1.0",
-      "provider": "gemini-api",
-      "description": "Hosted Gemini PR analysis.",
-      "creditCost": 1,
-      "artifactKey": null
-    }
-  ],
   "models": [
     {
       "modelId": "<modelId>",
       "code": "model-1",
       "name": "Model 1",
-      "taskType": "BOTH",
       "version": "1.0",
       "provider": "gemini-api",
       "description": "Hosted Gemini PR analysis.",
-      "creditCost": 1,
-      "artifactKey": null
+      "creditCost": 1
     }
-  ]
+  ],
+  "credits": 20,
+  "duration": 30
 }
 ```
 
@@ -1003,16 +1053,18 @@ Creates a plan using the plan write fields above. Duplicate code: 409. Unknown p
 
 Authentication: **Admin**.
 
-Required path planId: database UUID, not code. This example inherits FREE and removes direct models, so model-1 stays available through its parent. Unknown plan/parent/model: 404. Duplicate code or existing inheritance cycle: 409. Inheriting from itself or a descendant: 400 (`A plan cannot inherit from itself`). Blank name: 400. Credit changes affect current allowance without resetting usage.
+Required path planId: database UUID, not code. This example assigns model-1 directly. Unknown plan/model: 404. Duplicate code: 409. FREE cannot be renamed or deactivated (400). Blank name: 400. Credit changes affect current allowance without resetting usage.
 
 **Request body:**
 
 ```json
 {
-  "monthlyCredits": 40,
-  "parentPlanCode": "FREE",
-  "modelCodes": [],
-  "description": "40 credits each month"
+  "modelCodes": [
+    "model-1"
+  ],
+  "description": "40 credits per plan period",
+  "credits": 40,
+  "duration": 30
 }
 ```
 
@@ -1023,24 +1075,21 @@ Required path planId: database UUID, not code. This example inherits FREE and re
   "planId": "<planId>",
   "code": "STUDENT",
   "name": "Student",
-  "monthlyCredits": 40,
-  "description": "40 credits each month",
+  "description": "40 credits per plan period",
   "active": true,
-  "parentPlanCode": "FREE",
-  "directModels": [],
   "models": [
     {
       "modelId": "<modelId>",
       "code": "model-1",
       "name": "Model 1",
-      "taskType": "BOTH",
       "version": "1.0",
       "provider": "gemini-api",
       "description": "Hosted Gemini PR analysis.",
-      "creditCost": 1,
-      "artifactKey": null
+      "creditCost": 1
     }
-  ]
+  ],
+  "credits": 40,
+  "duration": 30
 }
 ```
 
@@ -1048,7 +1097,7 @@ Required path planId: database UUID, not code. This example inherits FREE and re
 
 Authentication: **Admin**.
 
-Required path planId: database UUID. No query parameters. Sets active=false; unknown ID returns 404. Deleting FREE returns 400: `The FREE plan cannot be deleted`. Inactive plans disappear from /plans and cannot be newly selected. Existing subscriptions are not cancelled/migrated. Reactivate with PATCH and {"active": true}.
+Required path planId: database UUID. No query parameters. Sets active=false; unknown ID returns 404. Deleting FREE returns 400: `The FREE plan cannot be deleted`. Inactive plans disappear from /plans and cannot be newly selected. Users with an inactive plan receive a new FREE subscription on their next plan-dependent request. Reactivate with PATCH and {"active": true}.
 
 **Request body:** none.
 
@@ -1061,24 +1110,21 @@ Required path planId: database UUID. No query parameters. Sets active=false; unk
     "planId": "<planId>",
     "code": "STUDENT",
     "name": "Student",
-    "monthlyCredits": 40,
-    "description": "40 credits each month",
+    "description": "40 credits per plan period",
     "active": false,
-    "parentPlanCode": "FREE",
-    "directModels": [],
     "models": [
       {
         "modelId": "<modelId>",
         "code": "model-1",
         "name": "Model 1",
-        "taskType": "BOTH",
         "version": "1.0",
         "provider": "gemini-api",
         "description": "Hosted Gemini PR analysis.",
-        "creditCost": 1,
-        "artifactKey": null
+        "creditCost": 1
       }
-    ]
+    ],
+    "credits": 40,
+    "duration": 30
   }
 }
 ```

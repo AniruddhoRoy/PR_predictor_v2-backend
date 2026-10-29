@@ -65,5 +65,4 @@ def analyze_pr(pr_url: str) -> dict:
                 raise ValueError("Invalid PR metadata")
     except (ValueError, KeyError, TypeError, AttributeError) as error:
         raise HTTPException(502, "Analysis service returned incomplete or invalid data") from error
-    result["pr_url"] = pr_url
     return result

@@ -5,7 +5,7 @@ request -> call the hosted analyzer -> save result and charge credits.
 """
 
 import os
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -19,9 +19,7 @@ from sqlalchemy.orm import Session
 from auth import create_token, hash_password, read_token, verify_password
 from database import Base, SessionLocal, engine, get_db
 from models import (
-    MLModel, Plan, Prediction,
-    PredictionInput, PredictionResult, PullRequest, Repository, Subscription,
-    UsagePeriod, User, UserSetting,
+    MLModel, Plan, Prediction, PredictionResult, Subscription, UsagePeriod, User, UserSetting,
 )
 from schemas import (
     ChangePasswordRequest, LoginRequest, PredictionRequest, ProfileUpdate, RegisterRequest,
@@ -52,6 +50,7 @@ def startup_event():
     migrate_schema()
     seed_database()
 
+# ! ############################################ Ignore it [Start] #############################################################
 
 def migrate_schema():
     """Add the few new columns when an older local SQLite database is reused."""
@@ -104,8 +103,8 @@ def seed_database():
                 db.add(plan)
                 new_plans.add(code)
             else:
-                if plan.monthly_credits is None:
-                    plan.monthly_credits = credits
+                if plan.credits is None:
+                    plan.credits = credits
             plans[code] = plan
         db.flush()
         for code in new_plans:
@@ -133,7 +132,7 @@ def seed_database():
     finally:
         db.close()
 
-
+# ! ############################################ Ignore it [End] #############################################################
 @app.get("/")
 def home():
     return {"message": "PR Predictor API is running", "docs": "/docs", "admin": "/admin/"}
@@ -175,7 +174,7 @@ def register(data: RegisterRequest, db: Session = Depends(get_db)):
     db.add(UserSetting(user_id=user.user_id))
     free = db.query(Plan).filter_by(code="FREE", active=True).first()
     if free:
-        db.add(Subscription(user_id=user.user_id, plan_id=free.plan_id, status="ACTIVE"))
+        _start_subscription(db, user, free)
     db.commit()
     db.refresh(user)
     return _token_response(user)
@@ -294,16 +293,17 @@ def _settings_dict(settings: UserSetting) -> dict:
 @app.get("/models")
 def models(prediction_type: Optional[str] = Query(default=None, alias="predictionType"), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     plan = _active_subscription(db, user).plan
-    allowed_ids = {item.model_id for item in _resolved_plan_models(plan)}
+    allowed_ids = {item.model_id for item in plan.models}
     query = db.query(MLModel).filter(MLModel.active.is_(True), MLModel.model_id.in_(allowed_ids))
     if prediction_type:
         prediction_type = prediction_type.upper()
-        query = query.filter(or_(MLModel.task_type == "BOTH", MLModel.task_type == prediction_type))
+        if prediction_type not in ALLOWED_PREDICTION_TYPES:
+            raise HTTPException(400, "Invalid predictionType")
     return [_model_dict(item) for item in query.order_by(MLModel.name).all()]
 
 
 def _model_dict(model: MLModel) -> dict:
-    return {"modelId": model.model_id, "code": model.code, "name": model.name, "taskType": model.task_type, "version": model.version, "provider": model.provider, "description": model.description, "creditCost": model.credit_cost, "artifactKey": model.artifact_key}
+    return {"modelId": model.model_id, "code": model.code, "name": model.name, "version": model.version, "provider": model.provider, "description": model.description, "creditCost": model.credit_cost}
 
 
 @app.get("/subscription")
@@ -315,16 +315,17 @@ def get_subscription(user: User = Depends(get_current_user), db: Session = Depen
 @app.get("/active-plan")
 @app.get("/plan")
 def active_plan(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    plan = _active_subscription(db, user).plan
-    usage = _get_usage(db, user, plan.monthly_credits)
+    subscription = _active_subscription(db, user)
+    plan = subscription.plan
+    usage = _get_usage(db, subscription)
     result = _plan_dict(plan)
-    result.update(creditsUsed=usage.credits_used, creditsRemaining=max(0, plan.monthly_credits - usage.credits_used))
+    result.update(creditsUsed=usage.credits_used, creditsRemaining=max(0, plan.credits - usage.credits_used))
     return result
 
 
 @app.get("/plans")
 def available_plans(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    return [_plan_dict(plan) for plan in db.query(Plan).filter_by(active=True).order_by(Plan.monthly_credits).all()]
+    return [_plan_dict(plan) for plan in db.query(Plan).filter_by(active=True).order_by(Plan.credits).all()]
 
 
 @app.post("/subscription")
@@ -332,50 +333,51 @@ def change_subscription(data: SubscriptionUpdate, user: User = Depends(get_curre
     plan = db.query(Plan).filter_by(code=data.plan_code.upper(), active=True).first()
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
-    for old in db.query(Subscription).filter_by(user_id=user.user_id, status="ACTIVE").all():
-        old.status = "CANCELLED"
-        old.ended_at = datetime.utcnow()
-    subscription = Subscription(user_id=user.user_id, plan_id=plan.plan_id, status="ACTIVE")
-    db.add(subscription)
+    old = _active_subscription(db, user)
+    if old.plan_id == plan.plan_id:
+        return _subscription_dict(old)
+    credits_used = _get_usage(db, old).credits_used
+    old.status = "CANCELLED"
+    old.ended_at = datetime.utcnow()
+    subscription = _start_subscription(db, user, plan, credits_used)
     db.commit()
-    db.refresh(subscription)
     return _subscription_dict(subscription)
+
+
+def _start_subscription(db: Session, user: User, plan: Plan, credits_used: int = 0) -> Subscription:
+    now = datetime.utcnow()
+    subscription = Subscription(user_id=user.user_id, plan=plan, status="ACTIVE",
+                                started_at=now, ended_at=now + timedelta(days=plan.duration))
+    db.add(subscription)
+    db.add(UsagePeriod(user_id=user.user_id, time_stamp=now, credits_used=credits_used))
+    db.flush()
+    return subscription
 
 
 def _active_subscription(db: Session, user: User) -> Subscription:
     subscription = db.query(Subscription).filter_by(user_id=user.user_id, status="ACTIVE").order_by(Subscription.started_at.desc()).first()
-    if not subscription:
-        plan = db.query(Plan).filter_by(code="FREE").first()
-        subscription = Subscription(user_id=user.user_id, plan_id=plan.plan_id, status="ACTIVE")
-        db.add(subscription)
-        db.commit()
-        db.refresh(subscription)
+    if subscription and subscription.ended_at > datetime.utcnow() and subscription.plan.active:
+        return subscription
+    if subscription:
+        subscription.status = "EXPIRED"
+    plan = db.query(Plan).filter_by(code="FREE", active=True).first()
+    if not plan:
+        raise HTTPException(404, "The FREE plan is unavailable")
+    subscription = _start_subscription(db, user, plan)
+    db.commit()
     return subscription
 
 
 def _subscription_dict(subscription: Subscription) -> dict:
-    return {"subscriptionId": subscription.subscription_id, "status": subscription.status, "startedAt": subscription.started_at.isoformat(), "plan": _plan_dict(subscription.plan)}
-
-
-def _resolved_plan_models(plan: Plan) -> list[MLModel]:
-    found = {}
-    seen = set()
-    while plan:
-        if plan.plan_id in seen:
-            raise HTTPException(status_code=409, detail="Plan inheritance contains a cycle")
-        seen.add(plan.plan_id)
-        for model in plan.models:
-            found[model.model_id] = model
-        plan = plan.parent
-    return sorted(found.values(), key=lambda item: item.name.lower())
+    return {"subscriptionId": subscription.subscription_id, "status": subscription.status,
+            "startedAt": subscription.started_at.isoformat(), "endedAt": subscription.ended_at.isoformat(),
+            "plan": _plan_dict(subscription.plan)}
 
 
 def _plan_dict(plan: Plan) -> dict:
     return {"planId": plan.plan_id, "code": plan.code, "name": plan.name,
-            "monthlyCredits": plan.monthly_credits, "description": plan.description,
-            "parentPlanCode": plan.parent.code if plan.parent else None,
-            "models": [_model_dict(model) for model in _resolved_plan_models(plan)]}
-
+            "credits": plan.credits, "duration": plan.duration, "description": plan.description,
+            "models": [_model_dict(model) for model in sorted(plan.models, key=lambda item: item.name.lower())]}
 
 
 def _prediction_request(body: PredictionRequest | str) -> PredictionRequest:
@@ -389,9 +391,9 @@ def _prediction_request(body: PredictionRequest | str) -> PredictionRequest:
 
 
 def _analysis_fields(response: dict, prediction_type: str) -> dict:
-    """Keep the frontend's fields and also return the service's full analysis."""
+    """Map analyzer fields for database storage and history records."""
     features, analysis = response["features"], response["analysis"]
-    owner, name, _, number = response["pr_url"].split("/")[3:]
+    owner, name, _, number = response["pr_url"].rstrip("/").split("/")[3:]
     return {
         "repository": {"owner": owner, "name": name, "url": f"https://github.com/{owner}/{name}"},
         "pullRequest": {"number": int(number), "url": response["pr_url"],
@@ -412,9 +414,7 @@ def _analysis_fields(response: dict, prediction_type: str) -> dict:
 def predict_dev(body: PredictionRequest | str = Body(...)):
     """Call the same service without login, credit charging, or saved history."""
     data = _prediction_request(body)
-    response = analyze_pr(data.pull_request_url)
-    return {"status": "COMPLETED", "predictionType": data.prediction_type,
-            "modelId": data.model_id, "factors": [], **_analysis_fields(response, data.prediction_type)}
+    return analyze_pr(data.pull_request_url)
 
 
 @app.post("/predict")
@@ -423,59 +423,43 @@ def predict(body: PredictionRequest | str = Body(...), user: User = Depends(get_
     prediction_type = request_data.prediction_type
     subscription = _active_subscription(db, user)
     plan = subscription.plan
-    model = _choose_model(db, request_data.model_id, prediction_type, plan)
-    usage = _get_usage(db, user, plan.monthly_credits)
-    if usage.credits_used + model.credit_cost > plan.monthly_credits:
+    model = _choose_model(db, request_data.model_id, plan)
+    usage = _get_usage(db, subscription)
+    if usage.credits_used + model.credit_cost > plan.credits:
         raise HTTPException(status_code=429, detail="Not enough credits for this model")
     # Release the database write lock while the external service is working.
     db.commit()
     response = analyze_pr(request_data.pull_request_url)
     fields = _analysis_fields(response, prediction_type)
-    repo, pr = fields["repository"], fields["pullRequest"]
-    repository = db.query(Repository).filter(Repository.provider == "github", func.lower(Repository.owner) == repo["owner"].lower(), func.lower(Repository.name) == repo["name"].lower()).first()
-    if not repository:
-        repository = Repository(provider="github", owner=repo["owner"], name=repo["name"], canonical_url=repo["url"])
-        db.add(repository)
-        db.flush()
-    pull_request = db.query(PullRequest).filter_by(repository_id=repository.repository_id, number=pr["number"]).first()
-    if not pull_request:
-        pull_request = PullRequest(repository_id=repository.repository_id, number=pr["number"])
-        db.add(pull_request)
-    pull_request.url = pr["url"]
-    pull_request.title = pr["title"]
-    pull_request.state = pr["state"]
-    pull_request.author_login = pr["authorLogin"]
-    pull_request.fetched_at = datetime.utcnow()
-    db.flush()
+    # The plan may have expired or changed while the analyzer was running.
+    if not db.query(Subscription).filter(Subscription.subscription_id == subscription.subscription_id,
+                                        Subscription.status == "ACTIVE", Subscription.ended_at > datetime.utcnow()).first():
+        raise HTTPException(409, "Your subscription changed or expired; try again")
     prediction = Prediction(user_id=user.user_id, usage_period_id=usage.usage_period_id, model_id=model.model_id,
-                            pull_request_id=pull_request.pull_request_id, prediction_type=prediction_type,
+                            pr_url=response["pr_url"], title=fields["pullRequest"]["title"], prediction_type=prediction_type,
                             status="COMPLETED", model_version=model.version, credits_cost=model.credit_cost,
                             inference_key="gemini-api", completed_at=datetime.utcnow())
     db.add(prediction)
     db.flush()
-    db.add(PredictionInput(prediction_id=prediction.prediction_id, input_mode="GITHUB_URL", github_url=pull_request.url))
     db.add(PredictionResult(prediction_id=prediction.prediction_id, merge_probability=fields["mergeProbability"],
                            quality_score=fields["qualityScore"], quality_label=fields["qualityLabel"],
                            recommendation=fields["recommendation"], analysis_response=response))
     # Reserve credits atomically so simultaneous requests cannot overspend.
     charged = db.query(UsagePeriod).filter(
         UsagePeriod.usage_period_id == usage.usage_period_id,
-        UsagePeriod.credits_used + model.credit_cost <= plan.monthly_credits,
-    ).update({UsagePeriod.predictions_used: UsagePeriod.predictions_used + 1,
-              UsagePeriod.credits_used: UsagePeriod.credits_used + model.credit_cost,
-              UsagePeriod.credit_limit_snapshot: plan.monthly_credits}, synchronize_session=False)
+        UsagePeriod.credits_used + model.credit_cost <= plan.credits,
+    ).update({UsagePeriod.credits_used: UsagePeriod.credits_used + model.credit_cost}, synchronize_session=False)
     if not charged:
         db.rollback()
         raise HTTPException(status_code=429, detail="Not enough credits for this model")
     db.commit()
-    db.refresh(prediction)
-    return _prediction_dict(prediction)
+    return response
 
 
-def _choose_model(db: Session, model_id: Optional[str], prediction_type: str, plan: Plan) -> MLModel:
-    allowed = _resolved_plan_models(plan)
+def _choose_model(db: Session, model_id: Optional[str], plan: Plan) -> MLModel:
+    allowed = plan.models
     allowed_ids = {item.model_id for item in allowed}
-    query = db.query(MLModel).filter(MLModel.active.is_(True), MLModel.model_id.in_(allowed_ids), or_(MLModel.task_type == "BOTH", MLModel.task_type == prediction_type))
+    query = db.query(MLModel).filter(MLModel.active.is_(True), MLModel.model_id.in_(allowed_ids))
     if model_id:
         key = model_id.strip().lower()
         model = query.filter(or_(MLModel.model_id == model_id, MLModel.code == key)).first()
@@ -486,20 +470,16 @@ def _choose_model(db: Session, model_id: Optional[str], prediction_type: str, pl
         raise HTTPException(status_code=404, detail="Prediction model not found")
     model = query.order_by(MLModel.created_at).first()
     if not model:
-        raise HTTPException(status_code=404, detail="Your active plan has no model for this prediction type")
+        raise HTTPException(status_code=404, detail="Your active plan has no active model")
     return model
 
 
-def _get_usage(db: Session, user: User, credit_limit: int) -> UsagePeriod:
-    today = date.today()
-    period_start = today.replace(day=1)
-    next_month = date(today.year + (1 if today.month == 12 else 0), 1 if today.month == 12 else today.month + 1, 1)
-    usage = db.query(UsagePeriod).filter_by(user_id=user.user_id, period_start=period_start).first()
+def _get_usage(db: Session, subscription: Subscription) -> UsagePeriod:
+    usage = db.query(UsagePeriod).filter_by(user_id=subscription.user_id, time_stamp=subscription.started_at).first()
     if not usage:
-        usage = UsagePeriod(user_id=user.user_id, period_start=period_start, period_end=next_month - timedelta(days=1), limit_snapshot=credit_limit, predictions_used=0, credits_used=0, credit_limit_snapshot=credit_limit)
+        usage = UsagePeriod(user_id=subscription.user_id, time_stamp=subscription.started_at, credits_used=0)
         db.add(usage)
         db.flush()
-    usage.credits_used = usage.credits_used or 0
     return usage
 
 
@@ -508,7 +488,7 @@ def _get_usage(db: Session, user: User, credit_limit: int) -> UsagePeriod:
 def history(search: Optional[str] = None, limit: int = Query(default=20, ge=1, le=100), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     query = db.query(Prediction).filter(Prediction.user_id == user.user_id).order_by(Prediction.created_at.desc())
     if search:
-        query = query.outerjoin(PullRequest).filter(or_(PullRequest.url.ilike(f"%{search}%"), PullRequest.title.ilike(f"%{search}%")))
+        query = query.filter(or_(Prediction.pr_url.ilike(f"%{search}%"), Prediction.title.ilike(f"%{search}%")))
     return [_prediction_dict(item) for item in query.limit(limit).all()]
 
 
@@ -522,8 +502,6 @@ def prediction_detail(prediction_id: str, user: User = Depends(get_current_user)
 
 def _prediction_dict(prediction: Prediction) -> dict:
     result = prediction.result
-    pr = prediction.pull_request
-    repository = pr.repository if pr else None
     data = {
         "predictionId": prediction.prediction_id,
         "status": prediction.status,
@@ -534,14 +512,13 @@ def _prediction_dict(prediction: Prediction) -> dict:
         "creditsCost": prediction.credits_cost,
         "inferenceKey": prediction.inference_key,
         "model": _model_dict(prediction.model) if prediction.model else None,
-        "repository": {"owner": repository.owner, "name": repository.name, "url": repository.canonical_url} if repository else None,
-        "pullRequest": {"number": pr.number, "url": pr.url, "title": pr.title, "state": pr.state, "authorLogin": pr.author_login} if pr else None,
-        "features": {item.feature_name: float(item.value_number) if item.value_type == "NUMBER" else item.value_boolean if item.value_type == "BOOLEAN" else item.value_text for item in prediction.features},
+        "pr_url": prediction.pr_url,
+        "title": prediction.title,
+        "features": {},
         "mergeProbability": float(result.merge_probability) if result and result.merge_probability is not None else None,
         "qualityScore": float(result.quality_score) if result and result.quality_score is not None else None,
         "qualityLabel": result.quality_label if result else None,
         "recommendation": result.recommendation if result else None,
-        "factors": [{"name": factor.factor_name, "description": factor.description, "impact": factor.impact, "order": factor.display_order} for factor in (result.factors if result else [])],
     }
     if result and result.analysis_response:
         data.update(_analysis_fields(result.analysis_response, prediction.prediction_type))
@@ -551,11 +528,11 @@ def _prediction_dict(prediction: Prediction) -> dict:
 @app.get("/dashboard")
 def dashboard(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     subscription = _active_subscription(db, user)
-    usage = _get_usage(db, user, subscription.plan.monthly_credits)
+    usage = _get_usage(db, subscription)
     total = db.query(Prediction).filter_by(user_id=user.user_id).count()
     average = db.query(func.avg(PredictionResult.merge_probability)).join(Prediction).filter(Prediction.user_id == user.user_id).scalar()
     recent = db.query(Prediction).filter_by(user_id=user.user_id).order_by(Prediction.created_at.desc()).limit(5).all()
-    return {"totalPredictions": total, "averageMergeProbability": round(float(average), 2) if average is not None else None, "usage": {"predictionsUsed": usage.predictions_used, "creditsUsed": usage.credits_used, "creditLimit": subscription.plan.monthly_credits, "creditsRemaining": max(0, subscription.plan.monthly_credits - usage.credits_used)}, "subscription": _subscription_dict(subscription), "recentPredictions": [_prediction_dict(item) for item in recent]}
+    return {"totalPredictions": total, "averageMergeProbability": round(float(average), 2) if average is not None else None, "usage": {"predictionsUsed": db.query(Prediction).filter_by(usage_period_id=usage.usage_period_id).count(), "creditsUsed": usage.credits_used, "creditLimit": subscription.plan.credits, "creditsRemaining": max(0, subscription.plan.credits - usage.credits_used)}, "subscription": _subscription_dict(subscription), "recentPredictions": [_prediction_dict(item) for item in recent]}
 
 
 @app.get("/admin/api/stats")
@@ -576,28 +553,13 @@ def _models_for_plan(db: Session, codes: list[str]) -> list[MLModel]:
     return result
 
 
-def _check_plan_parent(plan: Plan, parent: Optional[Plan]) -> None:
-    seen = set()
-    while parent:
-        if parent.plan_id == plan.plan_id:
-            raise HTTPException(status_code=400, detail="A plan cannot inherit from itself")
-        if parent.plan_id in seen:
-            raise HTTPException(status_code=409, detail="Plan inheritance contains a cycle")
-        seen.add(parent.plan_id)
-        parent = parent.parent
-
-
 def _admin_plan_dict(plan: Plan) -> dict:
-    return {"planId": plan.plan_id, "code": plan.code, "name": plan.name,
-            "monthlyCredits": plan.monthly_credits, "description": plan.description,
-            "active": plan.active, "parentPlanCode": plan.parent.code if plan.parent else None,
-            "directModels": [_model_dict(model) for model in plan.models],
-            "models": [_model_dict(model) for model in _resolved_plan_models(plan)]}
+    return {**_plan_dict(plan), "active": plan.active}
 
 
 @app.get("/admin/api/plans")
 def admin_plans(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
-    return [_admin_plan_dict(plan) for plan in db.query(Plan).order_by(Plan.monthly_credits).all()]
+    return [_admin_plan_dict(plan) for plan in db.query(Plan).order_by(Plan.credits).all()]
 
 
 @app.post("/admin/api/plans", status_code=status.HTTP_201_CREATED)
@@ -605,12 +567,9 @@ def admin_create_plan(data: PlanCreate, admin: User = Depends(require_admin), db
     code = data.code.strip().upper()
     if db.query(Plan).filter_by(code=code).first():
         raise HTTPException(status_code=409, detail="Plan code is already in use")
-    parent = db.query(Plan).filter_by(code=data.parent_plan_code.strip().upper()).first() if data.parent_plan_code else None
-    if data.parent_plan_code and not parent:
-        raise HTTPException(status_code=404, detail="Parent plan not found")
-    plan = Plan(code=code, name=data.name.strip(), monthly_credits=data.monthly_credits,
-                monthly_prediction_limit=data.monthly_credits, description=(data.description or "").strip(),
-                active=data.active, parent=parent, models=_models_for_plan(db, data.model_codes))
+    plan = Plan(code=code, name=data.name.strip(), credits=data.credits, duration=data.duration,
+                description=(data.description or "").strip(), active=data.active,
+                models=_models_for_plan(db, data.model_codes))
     if not plan.name:
         raise HTTPException(status_code=400, detail="Plan name cannot be blank")
     db.add(plan)
@@ -625,25 +584,24 @@ def admin_update_plan(plan_id: str, data: PlanUpdate, admin: User = Depends(requ
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
     values = data.model_dump(exclude_unset=True, by_alias=False)
+    if any(value is None for key, value in values.items() if key not in {"description", "model_codes"}):
+        raise HTTPException(422, "Required fields cannot be null")
     if "code" in values:
         values["code"] = values["code"].strip().upper()
+        if plan.code == "FREE" and values["code"] != "FREE":
+            raise HTTPException(400, "The FREE plan cannot be renamed")
         if db.query(Plan).filter(Plan.code == values["code"], Plan.plan_id != plan_id).first():
             raise HTTPException(status_code=409, detail="Plan code is already in use")
     if "name" in values:
         values["name"] = values["name"].strip()
         if not values["name"]:
             raise HTTPException(status_code=400, detail="Plan name cannot be blank")
-    if "parent_plan_code" in values:
-        parent = db.query(Plan).filter_by(code=values["parent_plan_code"].strip().upper()).first() if values["parent_plan_code"] else None
-        if values["parent_plan_code"] and not parent:
-            raise HTTPException(status_code=404, detail="Parent plan not found")
-        _check_plan_parent(plan, parent)
-        plan.parent = parent
-        values.pop("parent_plan_code")
     if "model_codes" in values:
         plan.models = _models_for_plan(db, values.pop("model_codes") or [])
-    if "monthly_credits" in values:
-        plan.monthly_prediction_limit = values["monthly_credits"]
+    if plan.code == "FREE" and values.get("active") is False:
+        raise HTTPException(400, "The FREE plan cannot be deactivated")
+    if values.get("description") is None and "description" in values:
+        values["description"] = ""
     for key, value in values.items():
         setattr(plan, key, value)
     db.commit()
@@ -667,13 +625,6 @@ def admin_delete_plan(plan_id: str, admin: User = Depends(require_admin), db: Se
 @app.get("/admin/api/users")
 def admin_users(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     return [_public_user(user) for user in db.query(User).order_by(User.created_at.desc()).all()]
-
-
-def _validate_model_task_type(task_type: str) -> str:
-    task_type = task_type.upper().strip()
-    if task_type not in ALLOWED_PREDICTION_TYPES:
-        raise HTTPException(status_code=400, detail="taskType must be MERGE_PROBABILITY, PR_QUALITY, or BOTH")
-    return task_type
 
 
 def _admin_model_dict(model: MLModel) -> dict:
@@ -701,7 +652,7 @@ def admin_create_model(data: ModelCreate, admin: User = Depends(require_admin), 
         raise HTTPException(status_code=400, detail="Model code, name, and version cannot be blank")
     if db.query(MLModel).filter_by(code=code).first():
         raise HTTPException(status_code=409, detail="Model code is already in use")
-    model = MLModel(code=code, name=name, task_type=_validate_model_task_type(data.task_type), version=version, provider=data.provider, description=data.description, credit_cost=data.credit_cost, artifact_key=data.artifact_key or code, active=data.active)
+    model = MLModel(code=code, name=name, version=version, provider=data.provider, description=data.description, credit_cost=data.credit_cost, active=data.active)
     if not model.active:
         model.retired_at = datetime.utcnow()
     db.add(model)
@@ -716,6 +667,8 @@ def admin_update_model(model_id: str, data: ModelUpdate, admin: User = Depends(r
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
     values = data.model_dump(exclude_unset=True, by_alias=False)
+    if any(value is None for key, value in values.items() if key not in {"description", "model_codes"}):
+        raise HTTPException(422, "Required fields cannot be null")
     if "code" in values:
         code = values["code"].strip().lower()
         if not code:
@@ -732,10 +685,6 @@ def admin_update_model(model_id: str, data: ModelUpdate, admin: User = Depends(r
         values["version"] = values["version"].strip()
         if not values["version"]:
             raise HTTPException(status_code=400, detail="Model version cannot be blank")
-    if "task_type" in values:
-        values["task_type"] = _validate_model_task_type(values["task_type"])
-    if "artifact_key" in values and values["artifact_key"]:
-        values["artifact_key"] = values["artifact_key"].strip().lower()
     for key, value in values.items():
         setattr(model, key, value)
     if data.active is False:

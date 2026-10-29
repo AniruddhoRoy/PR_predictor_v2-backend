@@ -1,5 +1,6 @@
 import os
 import unittest
+from copy import deepcopy
 from unittest.mock import patch
 
 os.environ['DATABASE_URL'] = 'sqlite://'
@@ -11,7 +12,7 @@ import app as backend
 from fastapi import HTTPException
 from auth import verify_password
 from database import Base
-from models import Plan, User, PredictionResult, Repository, PredictionFeature
+from models import Plan, User, Prediction, PredictionResult, Subscription, UsagePeriod
 
 
 ANALYSIS = {
@@ -52,12 +53,12 @@ class CreditPlansTest(unittest.TestCase):
     def test_admin_changes_survive_restart(self):
         plans = self.client.get('/admin/api/plans', headers=self.admin).json()
         plus = next(p for p in plans if p['code'] == 'PLUS')
-        response = self.client.patch('/admin/api/plans/' + plus['planId'], headers=self.admin, json={'monthlyCredits': 0, 'modelCodes': ['model-4'], 'parentPlanCode': None})
+        response = self.client.patch('/admin/api/plans/' + plus['planId'], headers=self.admin, json={'credits': 0, 'duration': 7, 'modelCodes': ['model-4']})
         self.assertEqual(response.status_code, 200)
         backend.seed_database()
         with self.sessions() as db:
             plan = db.query(Plan).filter_by(code='PLUS').one()
-            self.assertEqual(plan.monthly_credits, 0)
+            self.assertEqual(plan.credits, 0)
             self.assertEqual([m.code for m in plan.models], ['model-4'])
 
     def test_access_cost_and_failure(self):
@@ -72,17 +73,19 @@ class CreditPlansTest(unittest.TestCase):
         with patch.object(backend, 'analyze_pr', return_value=ANALYSIS) as service:
             result = self.client.post('/predict', headers=self.headers, json=body)
             self.assertEqual(result.status_code, 200)
-            self.assertEqual(result.json()['creditsCost'], 3)
+            self.assertEqual(result.json(), ANALYSIS)
             self.assertEqual(self.client.post('/predict', headers=self.headers, json=body).status_code, 429)
             service.assert_called_once_with(body['pullRequestUrl'])
-        data = result.json()
+        data = self.client.get('/history', headers=self.headers).json()[0]
+        self.assertEqual(data['creditsCost'], 3)
         self.assertEqual(data['mergeProbability'], 95)
         self.assertEqual(data['qualityScore'], 92)
         self.assertEqual(data['inferenceKey'], 'gemini-api')
         self.assertEqual(data['analysis'], ANALYSIS['analysis'])
         self.assertEqual(data['features'], ANALYSIS['features'])
         self.assertEqual(data['probabilityNote'], ANALYSIS['probability_note'])
-        self.assertEqual(self.client.get('/history', headers=self.headers).json(), [data])
+        with self.sessions() as db:
+            self.assertEqual(db.query(PredictionResult).one().analysis_response, ANALYSIS)
         self.assertEqual(self.client.get('/predictions/' + data['predictionId'], headers=self.headers).json(), data)
         dashboard = self.client.get('/dashboard', headers=self.headers).json()
         self.assertEqual(dashboard['totalPredictions'], 1)
@@ -93,16 +96,22 @@ class CreditPlansTest(unittest.TestCase):
         self.assertEqual(len(plan['models']), 6)
         self.assertEqual(plan['creditsUsed'], 3)
 
-    def test_prediction_dev_and_types(self):
+    def test_prediction_routes_return_entire_analyzer_response(self):
+        response_body = deepcopy(ANALYSIS)
+        response_body['pr_url'] += '/'
+        response_body['service_metadata'] = {'version': 'new', 'optional': None}
+        response_body['features']['extra_details'] = [{'enabled': False}]
+        response_body['analysis']['extra_scores'] = {'future_score': 88}
         for prediction_type in ('BOTH', 'PR_QUALITY', 'MERGE_PROBABILITY'):
-            with self.subTest(prediction_type=prediction_type), patch.object(backend, 'analyze_pr', return_value=ANALYSIS):
+            with self.subTest(prediction_type=prediction_type), patch.object(backend, 'analyze_pr', return_value=response_body):
                 body = {'pullRequestUrl': ANALYSIS['pr_url'], 'predictionType': prediction_type}
                 for route, headers in [('/predict-dev', {}), ('/predict', self.headers)]:
                     response = self.client.post(route, json=body, headers=headers)
                     self.assertEqual(response.status_code, 200)
-                    self.assertEqual(response.json()['mergeProbability'], None if prediction_type == 'PR_QUALITY' else 95)
-                    self.assertEqual(response.json()['qualityScore'], None if prediction_type == 'MERGE_PROBABILITY' else 92)
-                    self.assertEqual(response.json()['analysis'], ANALYSIS['analysis'])
+                    self.assertEqual(response.json(), response_body)
+        with self.sessions() as db:
+            for saved in db.query(PredictionResult).all():
+                self.assertEqual(saved.analysis_response, response_body)
         self.assertEqual(self.client.get('/active-plan', headers=self.headers).json()['creditsUsed'], 3)
         self.assertEqual(len(self.client.get('/history', headers=self.headers).json()), 3)
         with patch.object(backend, 'analyze_pr', return_value=ANALYSIS):
@@ -119,7 +128,7 @@ class CreditPlansTest(unittest.TestCase):
         self.assertEqual(self.client.get('/history', headers=self.headers).json(), [])
         with self.sessions() as db:
             self.assertEqual(db.query(PredictionResult).count(), 0)
-            self.assertEqual(db.query(Repository).count(), 0)
+            self.assertEqual(db.query(Prediction).count(), 0)
 
     def test_url_aliases_and_bad_inputs(self):
         with patch.object(backend, 'analyze_pr', return_value=ANALYSIS):
@@ -131,23 +140,14 @@ class CreditPlansTest(unittest.TestCase):
                     self.assertEqual(self.client.post(route, headers=headers, json=body).status_code, 422)
             service.assert_not_called()
 
-    def test_old_history_still_loads(self):
+    def test_history_search_uses_saved_url_and_title(self):
         with patch.object(backend, 'analyze_pr', return_value=ANALYSIS):
             self.client.post('/predict', json=ANALYSIS['pr_url'], headers=self.headers)
-        with self.sessions() as db:
-            result = db.query(PredictionResult).one()
-            result.analysis_response = None
-            db.add(PredictionFeature(prediction_id=result.prediction_id, feature_name='total_commits', value_type='NUMBER', value_number=1, source='GITHUB'))
-            db.commit()
-        # Reproduce the previous schema and run the startup migration twice.
-        with self.engine.begin() as connection:
-            connection.execute(text('ALTER TABLE prediction_results DROP COLUMN analysis_response'))
-        backend.migrate_schema()
-        backend.migrate_schema()
-        data = self.client.get('/history', headers=self.headers).json()[0]
-        self.assertEqual(data['mergeProbability'], 95)
-        self.assertEqual(data['features'], {'total_commits': 1.0})
-        self.assertEqual(data['pullRequest']['number'], 12)
+        for search in ('login', 'owner/repo'):
+            history = self.client.get('/history', params={'search': search}, headers=self.headers).json()
+            self.assertEqual(len(history), 1)
+            self.assertEqual(history[0]['pr_url'], ANALYSIS['pr_url'])
+        self.assertEqual(self.client.get('/history?search=missing', headers=self.headers).json(), [])
 
     def test_change_password_for_user_and_admin(self):
         for username, headers in [('tester', self.headers), ('admin', self.admin)]:
