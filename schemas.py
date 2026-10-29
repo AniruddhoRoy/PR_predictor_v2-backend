@@ -8,7 +8,7 @@
 
 from typing import Optional
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 
 class RegisterRequest(BaseModel):
@@ -36,6 +36,13 @@ class ProfileUpdate(BaseModel):
     email: Optional[str] = None #! this is equivalent to upper one
     github_profile_url: Optional[str] = Field(default=None, alias="githubProfileUrl")
     model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("email")
+    @classmethod
+    def email_not_null(cls, value):
+        if value is None:
+            raise ValueError("email cannot be null")
+        return value
 
 
 class SettingsUpdate(BaseModel):

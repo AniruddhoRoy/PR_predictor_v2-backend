@@ -230,7 +230,7 @@ No path/query parameters. Current public account information. `GET /profile` is 
 
 Authentication: **User**.
 
-All fields are optional: fullName (string), email (string), githubProfileUrl (string or null). Null clears githubProfileUrl. Send a string for email; duplicate email returns 409: `Email is already registered`. Email is trimmed/lowercased, fullName is trimmed. This route cannot change username, password, or role.
+All fields are optional: fullName (string), email (string), githubProfileUrl (string or null). Null clears githubProfileUrl. Send a string for email; explicit null returns 422 and leaves the profile unchanged. Duplicate email returns 409: `Email is already registered`. Email is trimmed/lowercased, fullName is trimmed. This route cannot change username, password, or role.
 
 **Request body:**
 

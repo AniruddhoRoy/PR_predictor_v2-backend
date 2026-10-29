@@ -54,6 +54,14 @@ class CreditPlansTest(unittest.TestCase):
         backend.app.dependency_overrides.clear()
         self.engine.dispose()
 
+    def test_profile_email_null_is_rejected(self):
+        before = self.client.get('/profile', headers=self.headers).json()
+        response = self.client.patch('/profile', headers=self.headers, json={'email': None})
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.client.get('/profile', headers=self.headers).json(), before)
+        self.assertEqual(self.client.patch('/profile', headers=self.headers, json={}).status_code, 200)
+        self.assertEqual(self.client.patch('/profile', headers=self.headers, json={'githubProfileUrl': None}).status_code, 200)
+
     def test_admin_changes_survive_restart(self):
         plans = self.client.get('/admin/api/plans', headers=self.admin).json()
         plus = next(p for p in plans if p['code'] == 'PLUS')
