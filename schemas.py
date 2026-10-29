@@ -52,6 +52,13 @@ class SettingsUpdate(BaseModel):
     default_input_mode: Optional[str] = Field(default=None, alias="defaultInputMode")
     model_config = ConfigDict(populate_by_name=True)
 
+    @field_validator("notifications_enabled")
+    @classmethod
+    def notifications_not_null(cls, value):
+        if value is None:
+            raise ValueError("notificationsEnabled cannot be null")
+        return value
+
 
 class SubscriptionUpdate(BaseModel):
     plan_code: str = Field(alias="planCode")

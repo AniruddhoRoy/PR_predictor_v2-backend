@@ -326,7 +326,7 @@ No path/query parameters. Missing settings are created using defaults.
 
 Authentication: **User**.
 
-All fields are optional. Send values, not null.
+All fields are optional. Send values, not null. Explicit null for notificationsEnabled returns 422; omit it to keep the current value.
 
 | Field                 | Type    | Allowed values                      |
 | --------------------- | ------- | ----------------------------------- |

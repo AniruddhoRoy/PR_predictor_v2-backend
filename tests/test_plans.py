@@ -62,6 +62,17 @@ class CreditPlansTest(unittest.TestCase):
         self.assertEqual(self.client.patch('/profile', headers=self.headers, json={}).status_code, 200)
         self.assertEqual(self.client.patch('/profile', headers=self.headers, json={'githubProfileUrl': None}).status_code, 200)
 
+    def test_notification_null_is_rejected(self):
+        before = self.client.get('/settings', headers=self.headers).json()
+        response = self.client.patch('/settings', headers=self.headers, json={'notificationsEnabled': None})
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.client.get('/settings', headers=self.headers).json(), before)
+        self.assertEqual(self.client.patch('/settings', headers=self.headers, json={}).status_code, 200)
+        for value in (False, True):
+            response = self.client.patch('/settings', headers=self.headers, json={'notificationsEnabled': value})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()['notificationsEnabled'], value)
+
     def test_admin_changes_survive_restart(self):
         plans = self.client.get('/admin/api/plans', headers=self.admin).json()
         plus = next(p for p in plans if p['code'] == 'PLUS')
