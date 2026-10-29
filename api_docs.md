@@ -558,25 +558,23 @@ The backend calls `POST https://pr-predictor-backend-gemini-api.onrender.com/ana
 
 ### `POST /predict`
 
-Authentication: **User**. No path/query parameters. The request is synchronous. It checks plan/model access and credits before calling the service, saves the complete successful response, and charges the selected model's creditCost once. All catalog models use the same analyzer; modelId controls access/cost only.
+Authentication: **User**. No path/query parameters. The request is synchronous. It checks plan/model access and credits before calling the service, saves the feature and analysis fields in PredictionResult, and charges the selected model's creditCost once. All catalog models use the same analyzer; modelId controls access/cost only.
 
 **Request body:**
 
 ```json
 {
   "pullRequestUrl": "https://github.com/owner/repo/pull/12",
-  "predictionType": "BOTH",
-  "modelId": "model-1"
+  "modelId": "<model UUID from GET /models>"
 }
 ```
 
 | Field | Type | Required | Rules |
 | --- | --- | --- | --- |
 | pullRequestUrl | string | Yes | HTTPS GitHub PR URL; aliases `pr_url` and `pull_request_url` are also accepted |
-| predictionType | string | No | BOTH (default), MERGE_PROBABILITY, or PR_QUALITY; uppercased |
-| modelId | string or null | No | Model code or UUID from GET /models; omitted/null selects an allowed active model |
+| modelId | string | Yes | Model UUID from GET /models; model codes such as model-1 are not accepted |
 
-A JSON string URL is also accepted: `"https://github.com/owner/repo/pull/12"`. Unknown body fields are rejected with 422. An active model outside the plan or incompatible with the requested type returns 403; missing/inactive models return 404.
+Send a JSON object containing both the URL and modelId. A bare URL string, missing modelId, predictionType, and unknown fields return 422. An active model outside the plan returns 403; missing/inactive models return 404.
 
 **Response 200:** the complete JSON object returned by `/analyze`, unchanged. Both prediction routes return the same structure. For example:
 
@@ -624,21 +622,23 @@ A JSON string URL is also accepted: `"https://github.com/owner/repo/pull/12"`. U
 
 All service fields are returned, including any extra top-level fields and nested features, files/patches, comments, reviews, commits, checks, statuses, warnings, recommendations, improvements, limitations, and confidence. Field names and values are not renamed, filtered, or supplemented with local metadata.
 
-`predictionType` still controls local model eligibility and the score columns saved for history, but does not filter the returned JSON: both analyzer scores are returned for every prediction type. Read the scores from `analysis.merge_probability` and `analysis.quality_score`. The response does not add `predictionId`, `creditsCost`, or other local fields; use `/history` for saved IDs and `/active-plan` for the remaining credits.
+Both analyzer scores are saved. Read them from `analysis.merge_probability` and `analysis.quality_score`. The response does not add `predictionId` or `creditsCost`; use `/predictions` for saved IDs and `/active-plan` for remaining credits. History stores the fields defined in PredictionResult; extra analyzer fields are returned by POST but are not saved.
 
 **Errors (no credits charged):**
 
 | Status | Meaning |
 | --- | --- |
-| 400 | Unsupported predictionType |
 | 401 | Missing/invalid local login token, or the service rejected PR_ANALYZER_TOKEN (the detail distinguishes them) |
-| 403 | Model access denied by the current plan/task type |
+| 403 | Model access denied by the current plan |
+| 409 | Subscription expired or changed while the analyzer was running |
 | 404 | Missing/inactive model, inaccessible/missing PR, or missing managed service token |
 | 422 | Invalid body, invalid PR URL, or rejected service request |
 | 429 | Not enough credits for the selected model |
 | 502 | Connection failure, upstream error, or incomplete/invalid service response |
 | 503 | PR_ANALYZER_TOKEN not set, service configuration missing, service quota/rate limit, or service unavailable |
 | 504 | GitHub/Gemini timeout or analysis service timeout |
+
+Analyzer failures are saved as FAILED predictions with httpStatus and errorMessage, zero creditsCost, and no result. Local validation/access/credit failures do not create prediction records.
 
 ### `POST /predict-dev`
 
@@ -650,20 +650,19 @@ Authentication: **Public**. Same input as POST /predict. This route calls the sa
 
 Authentication: **User**. Request body: none. Query: optional `search` (matches stored PR URL/title), `limit` (integer 1–100, default 20).
 
-**Response 200:** an array of local history records for the current user, newest first. Empty history is `[]`. Each item retains local metadata and the existing history format below; it is different from the raw POST /predict response. Reading history does not call the service again. Older entries may not contain analysis or probabilityNote.
+**Response 200:** an array of local history records for the current user, newest first. Empty history is `[]`. Each item includes local metadata plus features and analysis read from PredictionResult. Reading history does not call the analyzer. Fields absent from the analyzer response are null; failed predictions have empty features/analysis objects. predictionType, modelVersion, inferenceKey, repository, and pullRequest are no longer top-level history fields. Repository and PR metadata are inside features.
 
-One history item:
+One history item (nullable feature fields omitted here for readability):
 
 ```json
 {
   "predictionId": "<predictionId>",
   "status": "COMPLETED",
-  "predictionType": "BOTH",
-  "createdAt": "2026-10-28T12:00:00",
-  "completedAt": "2026-10-28T12:00:00",
-  "modelVersion": "1.0",
+  "createdAt": "2026-10-29T12:00:00",
+  "completedAt": "2026-10-29T12:00:02",
   "creditsCost": 1,
-  "inferenceKey": "gemini-api",
+  "httpStatus": 200,
+  "errorMessage": null,
   "model": {
     "modelId": "<modelId>",
     "code": "model-1",
@@ -671,39 +670,30 @@ One history item:
     "version": "1.0",
     "provider": "gemini-api",
     "description": "Hosted Gemini PR analysis.",
-    "creditCost": 1
+    "creditCost": 1,
+    "active": true,
+    "createdAt": "2026-10-29T12:00:00",
+    "retiredAt": null
   },
-  "repository": {
-    "owner": "owner",
-    "name": "repo",
-    "url": "https://github.com/owner/repo"
-  },
-  "pullRequest": {
-    "number": 12,
-    "url": "https://github.com/owner/repo/pull/12",
-    "title": "Fix login",
-    "state": "OPEN",
-    "authorLogin": "sam"
-  },
+  "pr_url": "https://github.com/owner/repo/pull/12",
+  "title": "Fix login",
   "features": {
+    "pr_url": "https://github.com/owner/repo/pull/12",
     "repository": "owner/repo",
     "number": 12,
     "title": "Fix login",
     "state": "open",
     "author": "sam",
     "merged": false,
+    "created_at": "2026-10-28T12:00:00",
+    "updated_at": "2026-10-29T12:00:00",
     "files": [
       {
         "filename": "app.py",
         "patch": "+fix"
       }
-    ],
-    "warnings": []
+    ]
   },
-  "mergeProbability": 95,
-  "qualityScore": 92,
-  "qualityLabel": "excellent",
-  "recommendation": "Fixes login.",
   "analysis": {
     "merge_probability": 95,
     "quality_score": 92,
@@ -724,13 +714,15 @@ One history item:
       "No CI results"
     ]
   },
-  "probabilityNote": "AI estimate, not a calibrated probability or a guarantee.",
-  "pr_url": "https://github.com/owner/repo/pull/12",
-  "title": "Fix login"
+  "mergeProbability": 95,
+  "qualityScore": 92,
+  "qualityLabel": "excellent",
+  "recommendation": "Fixes login.",
+  "probabilityNote": "AI estimate, not a calibrated probability or a guarantee."
 }
 ```
 
-For history records, MERGE_PROBABILITY has `qualityScore: null` and PR_QUALITY has `mergeProbability: null`; the saved `analysis` still contains both scores. `predictionId` is the local ID used by the detail route.
+Both scores are stored for every successful prediction. `features.number` comes from pr_number; `features.created_at` and `features.updated_at` come from pr_created_at and pr_updated_at. Feature lists and analysis recommendations are stored as JSON. `predictionId` is the local ID used by the detail route.
 
 ### `GET /predictions/{predictionId}`
 
@@ -1197,8 +1189,7 @@ No path/query parameters. Latest 100 prediction summaries across all users, newe
     "predictionId": "<predictionId>",
     "username": "sam",
     "status": "COMPLETED",
-    "predictionType": "BOTH",
-    "createdAt": "2026-10-04T12:00:00"
+      "createdAt": "2026-10-04T12:00:00"
   }
 ]
 ```
@@ -1244,7 +1235,7 @@ OpenAPI describes request validation. Many handlers return plain dictionaries wi
 1. Register or log in; store accessToken.
 2. Send the bearer header on protected calls.
 3. GET /active-plan to display credits and GET /models to show available models/costs.
-4. POST /predict with a GitHub PR URL (`pullRequestUrl`).
+4. POST /predict with a GitHub PR URL (`pullRequestUrl`) and the selected model UUID (`modelId`).
 5. Refresh /active-plan after success; use /history and /predictions/{predictionId} for saved results.
 6. Use GET /plans and POST /subscription to switch plans.
 
@@ -1256,12 +1247,12 @@ $loginBody = @{ username = "sam"; password = "pass1234" } | ConvertTo-Json
 $session = Invoke-RestMethod -Method Post -Uri "$apiBase/login" -ContentType "application/json" -Body $loginBody
 $headers = @{ Authorization = "Bearer $($session.accessToken)" }
 Invoke-RestMethod -Uri "$apiBase/active-plan" -Headers $headers
+$models = Invoke-RestMethod -Uri "$apiBase/models" -Headers $headers
 $predictionBody = @{
     pullRequestUrl = "https://github.com/owner/repository/pull/123"
-    predictionType = "BOTH"
-    modelId = "model-1"
+    modelId = $models[0].modelId
 } | ConvertTo-Json
 Invoke-RestMethod -Method Post -Uri "$apiBase/predict" -Headers $headers -ContentType "application/json" -Body $predictionBody
 ```
 
-The account must exist, have model-1 access, and have enough credits. Use the error table to handle unsuccessful responses.
+The account must exist, have at least one available model, and have enough credits. Use the error table to handle unsuccessful responses.

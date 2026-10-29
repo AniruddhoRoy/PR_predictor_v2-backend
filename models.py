@@ -42,6 +42,7 @@ class User(Base):
     subscriptions = relationship("Subscription", back_populates="user", cascade="all, delete-orphan")
     usage_periods = relationship("UsagePeriod", back_populates="user", cascade="all, delete-orphan")
     predictions = relationship("Prediction", back_populates="user", cascade="all, delete-orphan")
+    prediction_results = relationship("PredictionResult", back_populates="user")
 
 
 class UserSetting(Base):
@@ -186,4 +187,3 @@ class PredictionResult(Base):
  
     prediction = relationship("Prediction", back_populates="result")
     user = relationship("User", back_populates="prediction_results")
- 

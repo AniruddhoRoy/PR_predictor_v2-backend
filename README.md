@@ -32,12 +32,16 @@ Plans have credits and a duration in days. Each successful prediction spends the
 
 Both prediction routes call `https://pr-predictor-backend-gemini-api.onrender.com/analyze` with `{ "pr_url": "https://github.com/owner/repo/pull/123" }`. Set `PR_ANALYZER_TOKEN` in the backend environment before starting it (on Render, add it under Environment). The backend sends this service token; the frontend continues using its normal login token. No local model training, model files, or GitHub token are needed.
 
-Both `POST /predict` and `POST /predict-dev` return the complete `/analyze` JSON unchanged: `pr_url`, `features`, `analysis`, `probability_note`, and any additional service fields. No local response fields are added and no analyzer fields are renamed or filtered. The scores are `analysis.merge_probability` and `analysis.quality_score`, regardless of predictionType.
+Both `POST /predict` and `POST /predict-dev` return the complete `/analyze` JSON unchanged: `pr_url`, `features`, `analysis`, `probability_note`, and any additional service fields. No local response fields are added and no analyzer fields are renamed or filtered. The scores are `analysis.merge_probability` and `analysis.quality_score`.
 
-`POST /predict` keeps authentication, model access, plan credits, and history. It stores the full response and charges only successful predictions. Use `/history` for local prediction IDs and `/active-plan` for remaining credits. History includes the PR URL, title, scores, features, and analysis. The old factors list is removed.
+`POST /predict` keeps authentication, model access, plan credits, and history. It saves the feature and analysis fields in PredictionResult and charges only successful predictions. Analyzer failures are saved with their HTTP status and error, without charging credits. Use `/history` for local prediction IDs and `/active-plan` for remaining credits. History includes the PR URL, title, scores, features, and analysis. The old factors list is removed.
 
 `POST /predict-dev` calls the same service without authentication, credits, or history, as before. All catalog models now use this single service: `modelId` selects plan access and cost, not an external classifier. Model task types and artifact keys are removed.
 
 Verify with `python -m unittest discover -s tests` (install `httpx` for FastAPI's test client).
 
 See [api_docs.md](api_docs.md), [ER_DIAGRAM.md](ER_DIAGRAM.md), and [SCHEMA_DIAGRAM.md](SCHEMA_DIAGRAM.md) for the integration contract and database design.
+
+Prediction requests require a JSON object with `pr_url` (or `pullRequestUrl`) and `modelId` (a UUID returned by `/models`). `predictionType` and bare URL strings are no longer accepted. `/predictions` and `/predictions/{prediction_id}` return saved metadata, features, and analysis.
+
+Startup migrates older SQLite prediction records into the new columns and preserves existing users/history. Legacy manual records without a URL retain an empty URL. Legacy MySQL databases require a separate migration or a new database; automatic legacy migration supports SQLite only.

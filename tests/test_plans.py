@@ -1,4 +1,5 @@
 import os
+import json
 import unittest
 from copy import deepcopy
 from datetime import datetime, timedelta
@@ -46,6 +47,8 @@ class CreditPlansTest(unittest.TestCase):
         self.headers = {'Authorization': 'Bearer ' + user['accessToken']}
         admin = self.client.post('/login', json={'username': 'admin', 'password': '1234'}).json()
         self.admin = {'Authorization': 'Bearer ' + admin['accessToken']}
+        self.model_id = self.client.get('/models', headers=self.headers).json()[0]['modelId']
+        self.body = {'pr_url': ANALYSIS['pr_url'], 'modelId': self.model_id}
 
     def tearDown(self):
         backend.app.dependency_overrides.clear()
@@ -67,13 +70,15 @@ class CreditPlansTest(unittest.TestCase):
         subscription = self.client.get('/subscription', headers=self.headers).json()
         self.assertEqual(datetime.fromisoformat(subscription['endedAt']) - datetime.fromisoformat(subscription['startedAt']), timedelta(days=1))
         with patch.object(backend, 'analyze_pr', return_value=ANALYSIS):
-            self.client.post('/predict', json=ANALYSIS['pr_url'], headers=self.headers)
+            self.client.post('/predict', json=self.body, headers=self.headers)
         same = self.client.post('/subscription', headers=self.headers, json={'planCode': 'FREE'}).json()
         self.assertEqual(same['subscriptionId'], subscription['subscriptionId'])
         self.assertEqual(self.client.get('/active-plan', headers=self.headers).json()['creditsUsed'], 1)
         with self.sessions() as db:
             saved = db.get(Subscription, subscription['subscriptionId'])
+            saved.started_at -= timedelta(days=1)
             saved.ended_at = datetime.utcnow() - timedelta(seconds=1)
+            db.query(UsagePeriod).one().time_stamp = saved.started_at.date()
             db.commit()
         renewed = self.client.get('/subscription', headers=self.headers).json()
         self.assertNotEqual(renewed['subscriptionId'], subscription['subscriptionId'])
@@ -91,7 +96,7 @@ class CreditPlansTest(unittest.TestCase):
                 db.commit()
             return ANALYSIS
         with patch.object(backend, 'analyze_pr', side_effect=analyze):
-            response = self.client.post('/predict', json=ANALYSIS['pr_url'], headers=self.headers)
+            response = self.client.post('/predict', json=self.body, headers=self.headers)
         self.assertEqual(response.status_code, 409)
         with self.sessions() as db:
             self.assertEqual(db.query(Prediction).count(), 0)
@@ -118,38 +123,34 @@ class CreditPlansTest(unittest.TestCase):
 
     def test_legacy_migration_preserves_data_and_is_repeatable(self):
         with patch.object(backend, 'analyze_pr', return_value=ANALYSIS):
-            self.client.post('/predict', json=ANALYSIS['pr_url'], headers=self.headers)
+            self.client.post('/predict', json=self.body, headers=self.headers)
         with self.engine.begin() as connection:
-            connection.execute(text('ALTER TABLE plans RENAME COLUMN credits TO monthly_credits'))
-            connection.execute(text('ALTER TABLE plans DROP COLUMN duration'))
-            connection.execute(text('ALTER TABLE plans ADD COLUMN parent_plan_id VARCHAR(36)'))
-            connection.execute(text("UPDATE plans SET parent_plan_id = (SELECT plan_id FROM plans WHERE code = 'PLUS') WHERE code = 'PRO'"))
-            connection.execute(text("DELETE FROM plan_model_access WHERE plan_id = (SELECT plan_id FROM plans WHERE code = 'PRO')"))
-            connection.execute(text('ALTER TABLE models ADD COLUMN task_type VARCHAR(30)'))
-            connection.execute(text('ALTER TABLE predictions DROP COLUMN pr_url'))
-            connection.execute(text('ALTER TABLE predictions DROP COLUMN title'))
-            connection.execute(text('ALTER TABLE usage_periods RENAME TO old_usage'))
-            connection.execute(text('CREATE TABLE usage_periods (usage_period_id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36), period_start DATE, period_end DATE, credits_used INTEGER)'))
-            connection.execute(text("INSERT INTO usage_periods SELECT usage_period_id, user_id, date(time_stamp, 'start of month'), date(time_stamp, 'start of month', '+1 month', '-1 day'), credits_used FROM old_usage"))
-            connection.execute(text('DROP TABLE old_usage'))
-            connection.execute(text("UPDATE subscriptions SET ended_at = NULL WHERE status = 'ACTIVE'"))
+            connection.execute(text('ALTER TABLE predictions DROP COLUMN http_status'))
+            connection.execute(text('ALTER TABLE prediction_results RENAME TO old_results'))
+            connection.execute(text('CREATE TABLE prediction_results (result_id VARCHAR(36) PRIMARY KEY, prediction_id VARCHAR(36), analysis_response JSON, generated_at DATETIME)'))
+            connection.execute(text('INSERT INTO prediction_results SELECT result_id, prediction_id, :response, generated_at FROM old_results'), {'response': json.dumps(ANALYSIS)})
+            connection.execute(text('DROP TABLE old_results'))
         backend.migrate_schema()
         backend.seed_database()
         backend.migrate_schema()
         backend.seed_database()
         with self.sessions() as db:
             self.assertEqual(db.query(User).count(), 2)
-            self.assertEqual(db.query(PredictionResult).one().analysis_response, ANALYSIS)
+            result = db.query(PredictionResult).one()
+            self.assertEqual(result.summary, ANALYSIS['analysis']['summary'])
+            self.assertEqual(result.files, ANALYSIS['features']['files'])
+            self.assertEqual(result.user_id, db.query(Prediction).one().user_id)
             self.assertEqual(db.query(Prediction).one().pr_url, ANALYSIS['pr_url'])
             self.assertEqual(db.query(Plan).filter_by(code='FREE').one().credits, 5)
-            pro = db.query(Plan).filter_by(code='PRO').one()
-            self.assertEqual(sorted(m.code for m in pro.models), ['model-1', 'model-2', 'model-3'])
         self.assertEqual(self.client.get('/active-plan', headers=self.headers).json()['creditsUsed'], 1)
         self.assertEqual(len(self.client.get('/history', headers=self.headers).json()), 1)
+        with patch.object(backend, 'analyze_pr', return_value=ANALYSIS):
+            self.assertEqual(self.client.post('/predict', json=self.body, headers=self.headers).status_code, 200)
+        self.assertEqual(self.client.get('/active-plan', headers=self.headers).json()['creditsUsed'], 2)
 
     def test_migration_failure_rolls_back_schema_and_data(self):
         with self.engine.begin() as connection:
-            connection.execute(text('ALTER TABLE plans RENAME COLUMN credits TO monthly_credits'))
+            connection.execute(text('ALTER TABLE predictions DROP COLUMN http_status'))
         def fail_on_drop(connection, cursor, statement, parameters, context, executemany):
             if statement.startswith('DROP TABLE'):
                 raise RuntimeError('Simulated migration failure')
@@ -159,14 +160,15 @@ class CreditPlansTest(unittest.TestCase):
                 backend.migrate_schema()
         finally:
             event.remove(self.engine, 'before_cursor_execute', fail_on_drop)
-        self.assertIn('monthly_credits', {column['name'] for column in inspect(self.engine).get_columns('plans')})
+        self.assertNotIn('http_status', {column['name'] for column in inspect(self.engine).get_columns('predictions')})
         with self.engine.connect() as connection:
             self.assertEqual(connection.execute(text('SELECT COUNT(*) FROM users')).scalar(), 2)
 
     def test_access_cost_and_failure(self):
-        body = {'pullRequestUrl': 'https://github.com/owner/repo/pull/12', 'predictionType': 'BOTH', 'modelId': 'model-4'}
+        other = next(m for m in self.client.get('/admin/api/models', headers=self.admin).json() if m['code'] == 'model-4')
+        body = {'pullRequestUrl': ANALYSIS['pr_url'], 'modelId': other['modelId']}
         self.assertEqual(self.client.post('/predict', headers=self.headers, json=body).status_code, 403)
-        body['modelId'] = 'model-1'
+        body['modelId'] = self.model_id
         model = self.client.get('/models', headers=self.headers).json()[0]
         self.client.patch('/admin/api/models/' + model['modelId'], headers=self.admin, json={'creditCost': 3})
         with patch.object(backend, 'analyze_pr', side_effect=HTTPException(503, 'Service unavailable')):
@@ -182,15 +184,16 @@ class CreditPlansTest(unittest.TestCase):
         self.assertEqual(data['creditsCost'], 3)
         self.assertEqual(data['mergeProbability'], 95)
         self.assertEqual(data['qualityScore'], 92)
-        self.assertEqual(data['inferenceKey'], 'gemini-api')
+        self.assertEqual(data['httpStatus'], 200)
         self.assertEqual(data['analysis'], ANALYSIS['analysis'])
-        self.assertEqual(data['features'], ANALYSIS['features'])
+        for key, value in ANALYSIS['features'].items():
+            self.assertEqual(data['features'][key], value)
         self.assertEqual(data['probabilityNote'], ANALYSIS['probability_note'])
         with self.sessions() as db:
-            self.assertEqual(db.query(PredictionResult).one().analysis_response, ANALYSIS)
+            self.assertEqual(db.query(PredictionResult).one().summary, ANALYSIS['analysis']['summary'])
         self.assertEqual(self.client.get('/predictions/' + data['predictionId'], headers=self.headers).json(), data)
         dashboard = self.client.get('/dashboard', headers=self.headers).json()
-        self.assertEqual(dashboard['totalPredictions'], 1)
+        self.assertEqual(dashboard['totalPredictions'], 2)
         self.assertEqual(dashboard['averageMergeProbability'], 95)
         self.assertEqual(self.client.get('/active-plan', headers=self.headers).json()['creditsRemaining'], 2)
         self.client.post('/subscription', headers=self.headers, json={'planCode': 'ULTRA'})
@@ -204,52 +207,94 @@ class CreditPlansTest(unittest.TestCase):
         response_body['service_metadata'] = {'version': 'new', 'optional': None}
         response_body['features']['extra_details'] = [{'enabled': False}]
         response_body['analysis']['extra_scores'] = {'future_score': 88}
-        for prediction_type in ('BOTH', 'PR_QUALITY', 'MERGE_PROBABILITY'):
-            with self.subTest(prediction_type=prediction_type), patch.object(backend, 'analyze_pr', return_value=response_body):
-                body = {'pullRequestUrl': ANALYSIS['pr_url'], 'predictionType': prediction_type}
-                for route, headers in [('/predict-dev', {}), ('/predict', self.headers)]:
-                    response = self.client.post(route, json=body, headers=headers)
-                    self.assertEqual(response.status_code, 200)
-                    self.assertEqual(response.json(), response_body)
+        with patch.object(backend, 'analyze_pr', return_value=response_body):
+            for route, headers in [('/predict-dev', {}), ('/predict', self.headers)]:
+                response = self.client.post(route, json=self.body, headers=headers)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json(), response_body)
         with self.sessions() as db:
-            for saved in db.query(PredictionResult).all():
-                self.assertEqual(saved.analysis_response, response_body)
-        self.assertEqual(self.client.get('/active-plan', headers=self.headers).json()['creditsUsed'], 3)
-        self.assertEqual(len(self.client.get('/history', headers=self.headers).json()), 3)
-        with patch.object(backend, 'analyze_pr', return_value=ANALYSIS):
-            self.assertEqual(self.client.post('/predict-dev', json=ANALYSIS['pr_url']).status_code, 200)
-        self.assertEqual(self.client.post('/predict', json=ANALYSIS['pr_url']).status_code, 401)
+            saved = db.query(PredictionResult).one()
+            self.assertEqual(saved.files, response_body['features']['files'])
+            self.assertEqual(saved.pr_url, response_body['pr_url'])
+        self.assertEqual(self.client.get('/active-plan', headers=self.headers).json()['creditsUsed'], 1)
+        self.assertEqual(len(self.client.get('/history', headers=self.headers).json()), 1)
+        self.assertEqual(self.client.post('/predict', json=self.body).status_code, 401)
 
-    def test_failed_analysis_does_not_save_or_charge(self):
+    def test_failed_analysis_saves_error_without_result_or_charge(self):
         for code in (401, 404, 422, 502, 503, 504):
             with self.subTest(code=code), patch.object(backend, 'analyze_pr', side_effect=HTTPException(code, 'Service failed')):
                 for route, headers in [('/predict-dev', {}), ('/predict', self.headers)]:
-                    response = self.client.post(route, json=ANALYSIS['pr_url'], headers=headers)
+                    response = self.client.post(route, json=self.body, headers=headers)
                     self.assertEqual(response.status_code, code)
         self.assertEqual(self.client.get('/active-plan', headers=self.headers).json()['creditsUsed'], 0)
-        self.assertEqual(self.client.get('/history', headers=self.headers).json(), [])
+        history = self.client.get('/predictions', headers=self.headers).json()
+        self.assertEqual(len(history), 6)
+        for item in history:
+            self.assertEqual(item['status'], 'FAILED')
+            self.assertEqual(item['creditsCost'], 0)
+            self.assertEqual(item['features'], {})
+            self.assertEqual(item['analysis'], {})
+            self.assertEqual(item['errorMessage'], 'Service failed')
+            detail = self.client.get('/predictions/' + item['predictionId'], headers=self.headers)
+            self.assertEqual(detail.json(), item)
         with self.sessions() as db:
             self.assertEqual(db.query(PredictionResult).count(), 0)
-            self.assertEqual(db.query(Prediction).count(), 0)
+            self.assertEqual(db.query(Prediction).count(), 6)
 
     def test_url_aliases_and_bad_inputs(self):
         with patch.object(backend, 'analyze_pr', return_value=ANALYSIS):
             for field in ('pullRequestUrl', 'pr_url', 'pull_request_url'):
-                self.assertEqual(self.client.post('/predict-dev', json={field: ANALYSIS['pr_url']}).status_code, 200)
+                self.assertEqual(self.client.post('/predict-dev', json={field: ANALYSIS['pr_url'], 'modelId': self.model_id}).status_code, 200)
         with patch.object(backend, 'analyze_pr') as service:
-            for body in ('', ' ', {}, {'features': {}}, {'pr_url': None}, {'pr_url': ANALYSIS['pr_url'], 'unexpected': True}):
+            for body in ('', ANALYSIS['pr_url'], {}, {'pr_url': ANALYSIS['pr_url']}, {**self.body, 'modelId': None}, {**self.body, 'pr_url': 'bad'}, {**self.body, 'predictionType': 'BOTH'}, {**self.body, 'unexpected': True}):
                 for route, headers in [('/predict-dev', {}), ('/predict', self.headers)]:
                     self.assertEqual(self.client.post(route, headers=headers, json=body).status_code, 422)
             service.assert_not_called()
 
     def test_history_search_uses_saved_url_and_title(self):
         with patch.object(backend, 'analyze_pr', return_value=ANALYSIS):
-            self.client.post('/predict', json=ANALYSIS['pr_url'], headers=self.headers)
+            self.client.post('/predict', json=self.body, headers=self.headers)
         for search in ('login', 'owner/repo'):
             history = self.client.get('/history', params={'search': search}, headers=self.headers).json()
             self.assertEqual(len(history), 1)
             self.assertEqual(history[0]['pr_url'], ANALYSIS['pr_url'])
         self.assertEqual(self.client.get('/history?search=missing', headers=self.headers).json(), [])
+
+    def test_prediction_ownership_and_limits(self):
+        with patch.object(backend, 'analyze_pr', return_value=ANALYSIS):
+            self.client.post('/predict', json=self.body, headers=self.headers)
+        prediction = self.client.get('/predictions', headers=self.headers).json()[0]
+        self.assertEqual(self.client.get('/predictions', headers=self.admin).json(), [])
+        self.assertEqual(self.client.get('/predictions/' + prediction['predictionId'], headers=self.admin).status_code, 404)
+        self.assertEqual(self.client.get('/predictions/missing', headers=self.headers).status_code, 404)
+        self.assertEqual(self.client.get('/predictions?limit=0', headers=self.headers).status_code, 422)
+        self.assertEqual(self.client.get('/predictions').status_code, 401)
+
+    def test_result_columns_and_timestamps(self):
+        response = deepcopy(ANALYSIS)
+        response['features'].update(created_at='2026-10-01T01:02:03Z', updated_at='2026-10-02T01:02:03+00:00',
+                                    draft=False, mergeable=None, additions=0, labels=['fix'],
+                                    comments=[{'body': 'Looks good'}], reviews=[], statuses=[])
+        with patch.object(backend, 'analyze_pr', return_value=response):
+            self.assertEqual(self.client.post('/predict', json=self.body, headers=self.headers).status_code, 200)
+        with self.sessions() as db:
+            result = db.query(PredictionResult).one()
+            self.assertEqual(result.pr_created_at, datetime(2026, 10, 1, 1, 2, 3))
+            self.assertEqual(result.pr_number, 12)
+            self.assertEqual(result.repository, 'owner/repo')
+            self.assertEqual(result.comments, response['features']['comments'])
+            self.assertFalse(result.draft)
+            self.assertEqual(result.additions, 0)
+            self.assertIsNone(result.mergeable)
+        item = self.client.get('/predictions', headers=self.headers).json()[0]
+        self.assertEqual(item['features']['created_at'], '2026-10-01T01:02:03')
+        self.assertEqual(item['analysis']['recommendations'], response['analysis']['recommendations'])
+        with self.sessions() as db:
+            self.assertEqual(db.query(UsagePeriod).count(), 1)
+        response['features']['created_at'] = 'invalid timestamp'
+        with patch.object(backend, 'analyze_pr', return_value=response):
+            self.assertEqual(self.client.post('/predict', json=self.body, headers=self.headers).status_code, 502)
+        self.assertEqual(self.client.get('/active-plan', headers=self.headers).json()['creditsUsed'], 1)
 
     def test_change_password_for_user_and_admin(self):
         for username, headers in [('tester', self.headers), ('admin', self.admin)]:
