@@ -8,6 +8,7 @@ This is the small FastAPI service for the JavaFX PR Predictor project. It stores
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+$env:PR_ANALYZER_TOKEN = "your-service-api-token"
 python run.py
 ```
 
@@ -25,15 +26,15 @@ The admin page also works when opened through a separate static server such as V
 
 Signed-in users can change their password with `POST /change-password` and `currentPassword` / `newPassword` (4–128 characters for the new password). The admin page includes a Change password form. All private admin routes are connected to its dashboard, user roles, model controls, and plan controls.
 
-Plans have monthly credits; each successful prediction spends the selected model's credit cost. Admins can edit costs, plan credits, direct model codes, and parent plans at `/admin/`. Defaults: Free = 5 credits/model 1; Plus = 30 credits/models 1�3; Pro = 100 credits/Plus + models 4�6; Ultra = 300 credits/all Pro models. Admin edits survive restart, including a zero-credit plan.
+Plans have monthly credits; each successful prediction spends the selected model's credit cost. Admins can edit costs, plan credits, direct model codes, and parent plans at `/admin/`. Defaults: Free = 5 credits/model 1; Plus = 30 credits/models 1–3; Pro = 100 credits/Plus + models 4–6; Ultra = 300 credits/all Pro models. Admin edits survive restart, including a zero-credit plan.
 
 `GET /active-plan` (bearer token) returns the current plan, its models, `creditsUsed`, and `creditsRemaining`. Switching plans keeps credits already spent that month.
 
-Predictions use the preprocessing and classifiers in `models(notebook)/EDA_MY.ipynb`, trained lazily from `final_df.csv` using the notebook's training split. Models 1�5 match the notebook; model 6 is Extra Trees. Optional saved pipelines go in `trained_models/<artifactKey>.joblib`. Unknown or unavailable models return 503 without charging credits. The first prediction trains the selected model and may be slow. GitHub URL inputs fetch actual PR features; set `GITHUB_TOKEN` for private repositories or higher API limits. Predictions accept a GitHub pull request URL and fetch model features automatically.
+Both prediction routes call `https://pr-predictor-backend-gemini-api.onrender.com/analyze` with `{ "pr_url": "https://github.com/owner/repo/pull/123" }`. Set `PR_ANALYZER_TOKEN` in the backend environment before starting it (on Render, add it under Environment). The backend sends this service token; the frontend continues using its normal login token. No local model training, model files, or GitHub token are needed.
 
-For local testing only, `POST /predict-dev` runs the same URL prediction without login, plans, credits, or persistence. Remove that route before deployment.
+`POST /predict` keeps authentication, model access, monthly credits, and history. It stores the full service response and returns the service's independent merge probability and quality score, full `analysis`, and `probabilityNote`. Failed calls do not spend credits. Existing frontend fields such as `mergeProbability` and `qualityScore` still work. Existing prediction history remains readable; startup adds one nullable JSON column automatically.
 
-The notebook target is merge status. `qualityScore` currently reuses merge probability for compatibility; it is not a separately trained quality classifier.
+`POST /predict-dev` calls the same service without authentication, credits, or history, as before. All catalog models now use this single service: `modelId` selects plan access and cost, not an external classifier. The admin's obsolete artifact-key form field has been removed; the API/database field remains as compatibility metadata. The notebooks and CSV are kept as project source material but are not used at runtime.
 
 Verify with `python -m unittest discover -s tests` (install `httpx` for FastAPI's test client).
 

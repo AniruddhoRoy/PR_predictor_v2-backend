@@ -15,7 +15,7 @@ flowchart LR
   predictions["predictions\nPK prediction_id\nFK user_id\nFK model_id\nstatus/type"]
   inputs["prediction_inputs\nPK/FK prediction_id\ninput_mode"]
   features["prediction_features\nPK feature_id\nFK prediction_id\ntyped value"]
-  results["prediction_results\nPK result_id\nUQ/FK prediction_id\nscores"]
+  results["prediction_results\nPK result_id\nUQ/FK prediction_id\nscores\nanalysis_response JSON"]
   factors["prediction_factors\nPK factor_id\nFK result_id\nimpact/order"]
   users --> settings
   users --> subscriptions

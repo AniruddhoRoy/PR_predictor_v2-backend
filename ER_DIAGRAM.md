@@ -115,6 +115,7 @@ erDiagram
         decimal quality_score
         string quality_label
         string recommendation
+        json analysis_response
     }
     PREDICTION_FACTORS {
         string factor_id PK

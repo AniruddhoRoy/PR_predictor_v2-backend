@@ -1,13 +1,13 @@
 """Simple PR prediction backend.
 
 The service intentionally keeps the workflow synchronous and understandable:
-request -> validate -> run notebook model -> persist -> return result.
+request -> call the hosted analyzer -> save result and charge credits.
 """
 
 import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from auth import create_token, hash_password, read_token, verify_password
 from database import Base, SessionLocal, engine, get_db
 from models import (
-    MLModel, Plan, Prediction, PredictionFactor, PredictionFeature,
+    MLModel, Plan, Prediction,
     PredictionInput, PredictionResult, PullRequest, Repository, Subscription,
     UsagePeriod, User, UserSetting,
 )
@@ -27,8 +27,7 @@ from schemas import (
     ChangePasswordRequest, LoginRequest, PredictionRequest, ProfileUpdate, RegisterRequest,
     SettingsUpdate, SubscriptionUpdate, ModelCreate, ModelUpdate, PlanCreate, PlanUpdate,
 )
-from prediction_engine import predict as run_model_prediction
-from github_api import get_pull_request
+from analysis_api import analyze_pr
 
 
 app = FastAPI(title="PR Predictor API", version="1.0.0")
@@ -61,6 +60,7 @@ def migrate_schema():
         "models": {"credit_cost": "INTEGER DEFAULT 1", "artifact_key": "VARCHAR(80)"},
         "usage_periods": {"credits_used": "INTEGER DEFAULT 0", "credit_limit_snapshot": "INTEGER DEFAULT 5"},
         "predictions": {"credits_cost": "INTEGER DEFAULT 1", "inference_key": "VARCHAR(80)"},
+        "prediction_results": {"analysis_response": "JSON"},
     }
     existing = inspect(engine)
     with engine.begin() as connection:
@@ -78,23 +78,21 @@ def migrate_schema():
 def seed_database():
     db = SessionLocal()
     try:
-        model_data = [
-            ("model-1", "Model 1 - Logistic Regression", "logistic-regression"),
-            ("model-2", "Model 2 - Random Forest", "random-forest"),
-            ("model-3", "Model 3 - KNN", "knn"),
-            ("model-4", "Model 4 - Decision Tree", "decision-tree"),
-            ("model-5", "Model 5 - SGD Classifier", "sgd-classifier"),
-            ("model-6", "Model 6 - Extra Trees", "extra-trees"),
-        ]
         models = []
-        for code, name, artifact in model_data:
+        for number in range(1, 7):
+            code = f"model-{number}"
             model = db.query(MLModel).filter_by(code=code).first()
             if not model:
-                model = MLModel(code=code, name=name, task_type="BOTH", version="1.0", provider="notebook", artifact_key=artifact, credit_cost=1, description="Classifier trained from models(notebook)/final_df.csv.")
+                model = MLModel(code=code, name=f"Model {number}", task_type="BOTH", version="1.0",
+                                provider="gemini-api", credit_cost=1, description="Hosted Gemini PR analysis.")
                 db.add(model)
-            else:
-                model.artifact_key = model.artifact_key or artifact
-                model.credit_cost = model.credit_cost or 1
+            elif model.provider == "notebook":
+                # Keep existing plan assignments and prices when retiring local inference.
+                model.provider = "gemini-api"
+                model.artifact_key = None
+                model.description = "Hosted Gemini PR analysis."
+                if model.name.startswith(f"Model {number} - "):
+                    model.name = f"Model {number}"
             models.append(model)
         db.flush()
         plans = {}
@@ -380,86 +378,85 @@ def _plan_dict(plan: Plan) -> dict:
 
 
 
+def _prediction_request(body: PredictionRequest | str) -> PredictionRequest:
+    if isinstance(body, str) and not body.strip():
+        raise HTTPException(422, "A GitHub pull request URL is required")
+    data = PredictionRequest(pullRequestUrl=body) if isinstance(body, str) else body
+    data.prediction_type = data.prediction_type.upper()
+    if data.prediction_type not in ALLOWED_PREDICTION_TYPES:
+        raise HTTPException(400, "predictionType must be MERGE_PROBABILITY, PR_QUALITY, or BOTH")
+    return data
+
+
+def _analysis_fields(response: dict, prediction_type: str) -> dict:
+    """Keep the frontend's fields and also return the service's full analysis."""
+    features, analysis = response["features"], response["analysis"]
+    owner, name, _, number = response["pr_url"].split("/")[3:]
+    return {
+        "repository": {"owner": owner, "name": name, "url": f"https://github.com/{owner}/{name}"},
+        "pullRequest": {"number": int(number), "url": response["pr_url"],
+                        "title": features.get("title") or f"Pull request #{number}",
+                        "state": "MERGED" if features.get("merged") else (features.get("state") or "open").upper(),
+                        "authorLogin": features.get("author")},
+        "features": features,
+        "mergeProbability": None if prediction_type == "PR_QUALITY" else analysis["merge_probability"],
+        "qualityScore": None if prediction_type == "MERGE_PROBABILITY" else analysis["quality_score"],
+        "qualityLabel": analysis["quality"],
+        "recommendation": analysis["summary"],
+        "analysis": analysis,
+        "probabilityNote": response.get("probability_note"),
+    }
+
+
 @app.post("/predict-dev")
 def predict_dev(body: PredictionRequest | str = Body(...)):
-    """Development-only prediction route without auth, plans, credits, or persistence."""
-    request_data = PredictionRequest(pullRequestUrl=body) if isinstance(body, str) else body
-    prediction_type = request_data.prediction_type.upper()
-    if prediction_type not in ALLOWED_PREDICTION_TYPES:
-        raise HTTPException(status_code=400, detail="predictionType must be MERGE_PROBABILITY, PR_QUALITY, or BOTH")
-
-    github_repo, github_pr, features = get_pull_request(request_data.pull_request_url)
-    model_key = request_data.model_id or "model-1"
-    try:
-        merge_score, quality_score, factors = run_model_prediction(features, model_key)
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    except Exception as error:
-        raise HTTPException(status_code=503, detail="Notebook model is unavailable") from error
-
-    return {
-        "status": "COMPLETED",
-        "predictionType": prediction_type,
-        "modelId": model_key,
-        "repository": {"owner": github_repo["owner"]["login"], "name": github_repo["name"], "url": github_repo["html_url"]},
-        "pullRequest": {"number": github_pr["number"], "url": github_pr["html_url"], "title": github_pr["title"], "state": "MERGED" if github_pr.get("merged") else github_pr["state"].upper(), "authorLogin": (github_pr.get("user") or {}).get("login")},
-        "features": features,
-        "mergeProbability": None if prediction_type == "PR_QUALITY" else merge_score,
-        "qualityScore": None if prediction_type == "MERGE_PROBABILITY" else quality_score,
-        "qualityLabel": _quality_label(quality_score),
-        "recommendation": _recommendation(merge_score, quality_score),
-        "factors": [{"name": item["factor_name"], "description": item["description"], "impact": item["impact"], "order": index} for index, item in enumerate(factors)],
-    }
+    """Call the same service without login, credit charging, or saved history."""
+    data = _prediction_request(body)
+    response = analyze_pr(data.pull_request_url)
+    return {"status": "COMPLETED", "predictionType": data.prediction_type,
+            "modelId": data.model_id, "factors": [], **_analysis_fields(response, data.prediction_type)}
 
 
 @app.post("/predict")
 def predict(body: PredictionRequest | str = Body(...), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    request_data = PredictionRequest(pullRequestUrl=body) if isinstance(body, str) else body
-    prediction_type = request_data.prediction_type.upper()
-    if prediction_type not in ALLOWED_PREDICTION_TYPES:
-        raise HTTPException(status_code=400, detail="predictionType must be MERGE_PROBABILITY, PR_QUALITY, or BOTH")
+    request_data = _prediction_request(body)
+    prediction_type = request_data.prediction_type
     subscription = _active_subscription(db, user)
     plan = subscription.plan
     model = _choose_model(db, request_data.model_id, prediction_type, plan)
     usage = _get_usage(db, user, plan.monthly_credits)
     if usage.credits_used + model.credit_cost > plan.monthly_credits:
         raise HTTPException(status_code=429, detail="Not enough credits for this model")
-    github_repo, github_pr, features = get_pull_request(request_data.pull_request_url)
-    try:
-        merge_score, quality_score, factors = run_model_prediction(features, model.artifact_key or model.code)
-    except Exception as error:
-        db.rollback()
-        raise HTTPException(status_code=503, detail="Notebook model is unavailable; no credits were charged") from error
-    owner, repo_name = github_repo["owner"]["login"], github_repo["name"]
-    repository = db.query(Repository).filter(Repository.provider == "github", func.lower(Repository.owner) == owner.lower(), func.lower(Repository.name) == repo_name.lower()).first()
+    # Release the database write lock while the external service is working.
+    db.commit()
+    response = analyze_pr(request_data.pull_request_url)
+    fields = _analysis_fields(response, prediction_type)
+    repo, pr = fields["repository"], fields["pullRequest"]
+    repository = db.query(Repository).filter(Repository.provider == "github", func.lower(Repository.owner) == repo["owner"].lower(), func.lower(Repository.name) == repo["name"].lower()).first()
     if not repository:
-        repository = Repository(provider="github", owner=owner, name=repo_name, canonical_url=github_repo["html_url"])
+        repository = Repository(provider="github", owner=repo["owner"], name=repo["name"], canonical_url=repo["url"])
         db.add(repository)
         db.flush()
-    pull_request = db.query(PullRequest).filter_by(repository_id=repository.repository_id, number=github_pr["number"]).first()
+    pull_request = db.query(PullRequest).filter_by(repository_id=repository.repository_id, number=pr["number"]).first()
     if not pull_request:
-        pull_request = PullRequest(repository_id=repository.repository_id, number=github_pr["number"])
+        pull_request = PullRequest(repository_id=repository.repository_id, number=pr["number"])
         db.add(pull_request)
-    pull_request.url = github_pr["html_url"]
-    pull_request.title = github_pr["title"]
-    pull_request.state = "MERGED" if github_pr.get("merged") else github_pr["state"].upper()
-    pull_request.author_login = (github_pr.get("user") or {}).get("login")
+    pull_request.url = pr["url"]
+    pull_request.title = pr["title"]
+    pull_request.state = pr["state"]
+    pull_request.author_login = pr["authorLogin"]
     pull_request.fetched_at = datetime.utcnow()
     db.flush()
-    prediction = Prediction(user_id=user.user_id, usage_period_id=usage.usage_period_id, model_id=model.model_id, pull_request_id=pull_request.pull_request_id, prediction_type=prediction_type, status="COMPLETED", model_version=model.version, credits_cost=model.credit_cost, inference_key=model.artifact_key or model.code, completed_at=datetime.utcnow())
+    prediction = Prediction(user_id=user.user_id, usage_period_id=usage.usage_period_id, model_id=model.model_id,
+                            pull_request_id=pull_request.pull_request_id, prediction_type=prediction_type,
+                            status="COMPLETED", model_version=model.version, credits_cost=model.credit_cost,
+                            inference_key="gemini-api", completed_at=datetime.utcnow())
     db.add(prediction)
     db.flush()
     db.add(PredictionInput(prediction_id=prediction.prediction_id, input_mode="GITHUB_URL", github_url=pull_request.url))
-    for name, value in features.items():
-        db.add(_feature_row(prediction.prediction_id, name, value, "GITHUB"))
-    show_merge = None if prediction_type == "PR_QUALITY" else merge_score
-    show_quality = None if prediction_type == "MERGE_PROBABILITY" else quality_score
-    label = _quality_label(quality_score)
-    result = PredictionResult(prediction_id=prediction.prediction_id, merge_probability=show_merge, quality_score=show_quality, quality_label=label, recommendation=_recommendation(merge_score, quality_score))
-    db.add(result)
-    db.flush()
-    for index, factor in enumerate(factors):
-        db.add(PredictionFactor(result_id=result.result_id, display_order=index, **factor))
+    db.add(PredictionResult(prediction_id=prediction.prediction_id, merge_probability=fields["mergeProbability"],
+                           quality_score=fields["qualityScore"], quality_label=fields["qualityLabel"],
+                           recommendation=fields["recommendation"], analysis_response=response))
     # Reserve credits atomically so simultaneous requests cannot overspend.
     charged = db.query(UsagePeriod).filter(
         UsagePeriod.usage_period_id == usage.usage_period_id,
@@ -506,26 +503,6 @@ def _get_usage(db: Session, user: User, credit_limit: int) -> UsagePeriod:
     return usage
 
 
-def _feature_row(prediction_id: str, name: str, value: Any, source: str) -> PredictionFeature:
-    if isinstance(value, bool):
-        return PredictionFeature(prediction_id=prediction_id, feature_name=name, value_type="BOOLEAN", value_boolean=value, source=source)
-    if isinstance(value, (int, float)):
-        return PredictionFeature(prediction_id=prediction_id, feature_name=name, value_type="NUMBER", value_number=float(value), source=source)
-    return PredictionFeature(prediction_id=prediction_id, feature_name=name, value_type="TEXT", value_text=str(value), source=source)
-
-
-def _quality_label(score: float) -> str:
-    return "Excellent" if score >= 80 else "Good" if score >= 65 else "Needs review" if score >= 50 else "Risky"
-
-
-def _recommendation(merge_score: float, quality_score: float) -> str:
-    if merge_score >= 75 and quality_score >= 70:
-        return "Looks ready for review. Keep the existing tests and ask a reviewer to verify the edge cases."
-    if merge_score >= 55:
-        return "Review the change size and test coverage before merging."
-    return "Add tests and split the change into smaller parts before merging."
-
-
 @app.get("/history")
 @app.get("/predictions")
 def history(search: Optional[str] = None, limit: int = Query(default=20, ge=1, le=100), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -547,7 +524,7 @@ def _prediction_dict(prediction: Prediction) -> dict:
     result = prediction.result
     pr = prediction.pull_request
     repository = pr.repository if pr else None
-    return {
+    data = {
         "predictionId": prediction.prediction_id,
         "status": prediction.status,
         "predictionType": prediction.prediction_type,
@@ -566,6 +543,9 @@ def _prediction_dict(prediction: Prediction) -> dict:
         "recommendation": result.recommendation if result else None,
         "factors": [{"name": factor.factor_name, "description": factor.description, "impact": factor.impact, "order": factor.display_order} for factor in (result.factors if result else [])],
     }
+    if result and result.analysis_response:
+        data.update(_analysis_fields(result.analysis_response, prediction.prediction_type))
+    return data
 
 
 @app.get("/dashboard")

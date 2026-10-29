@@ -1,20 +1,30 @@
 import os
-import io
-import json
 import unittest
 from unittest.mock import patch
 
 os.environ['DATABASE_URL'] = 'sqlite://'
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import sessionmaker
 from fastapi.testclient import TestClient
 import app as backend
-import github_api
+from fastapi import HTTPException
 from auth import verify_password
 from database import Base
-from models import Plan, User
-from prediction_engine import predict, _row
+from models import Plan, User, PredictionResult, Repository, PredictionFeature
+
+
+ANALYSIS = {
+    "pr_url": "https://github.com/owner/repo/pull/12",
+    "features": {"repository": "owner/repo", "number": 12, "title": "Fix login",
+                 "state": "open", "author": "tester", "merged": False,
+                 "files": [{"filename": "app.py", "patch": "+fix"}], "warnings": []},
+    "analysis": {"merge_probability": 95, "quality_score": 92, "quality": "excellent",
+                 "confidence": "high", "summary": "Fixes login.", "merge_reasoning": "Small tested fix.",
+                 "recommendations": {"excellent": ["Tests included"], "good": [], "bad": [], "worst": []},
+                 "potential_improvements": [], "limitations": ["No CI results"]},
+    "probability_note": "AI estimate, not a calibrated probability or a guarantee.",
+}
 
 
 class CreditPlansTest(unittest.TestCase):
@@ -56,46 +66,88 @@ class CreditPlansTest(unittest.TestCase):
         body['modelId'] = 'model-1'
         model = self.client.get('/models', headers=self.headers).json()[0]
         self.client.patch('/admin/api/models/' + model['modelId'], headers=self.admin, json={'creditCost': 3})
-        github_data = ({'owner': {'login': 'owner'}, 'name': 'repo', 'html_url': 'https://github.com/owner/repo'},
-                       {'number': 12, 'html_url': body['pullRequestUrl'], 'title': 'Fix login', 'state': 'open'},
-                       {'total_lines_added': 10})
-        with patch.object(backend, 'get_pull_request', return_value=github_data), patch.object(backend, 'run_model_prediction', side_effect=RuntimeError('unavailable')):
+        with patch.object(backend, 'analyze_pr', side_effect=HTTPException(503, 'Service unavailable')):
             self.assertEqual(self.client.post('/predict', headers=self.headers, json=body).status_code, 503)
         self.assertEqual(self.client.get('/active-plan', headers=self.headers).json()['creditsUsed'], 0)
-        with patch.object(backend, 'get_pull_request', return_value=github_data), patch.object(backend, 'run_model_prediction', return_value=(80, 80, [])):
+        with patch.object(backend, 'analyze_pr', return_value=ANALYSIS) as service:
             result = self.client.post('/predict', headers=self.headers, json=body)
             self.assertEqual(result.status_code, 200)
             self.assertEqual(result.json()['creditsCost'], 3)
             self.assertEqual(self.client.post('/predict', headers=self.headers, json=body).status_code, 429)
+            service.assert_called_once_with(body['pullRequestUrl'])
+        data = result.json()
+        self.assertEqual(data['mergeProbability'], 95)
+        self.assertEqual(data['qualityScore'], 92)
+        self.assertEqual(data['inferenceKey'], 'gemini-api')
+        self.assertEqual(data['analysis'], ANALYSIS['analysis'])
+        self.assertEqual(data['features'], ANALYSIS['features'])
+        self.assertEqual(data['probabilityNote'], ANALYSIS['probability_note'])
+        self.assertEqual(self.client.get('/history', headers=self.headers).json(), [data])
+        self.assertEqual(self.client.get('/predictions/' + data['predictionId'], headers=self.headers).json(), data)
+        dashboard = self.client.get('/dashboard', headers=self.headers).json()
+        self.assertEqual(dashboard['totalPredictions'], 1)
+        self.assertEqual(dashboard['averageMergeProbability'], 95)
         self.assertEqual(self.client.get('/active-plan', headers=self.headers).json()['creditsRemaining'], 2)
         self.client.post('/subscription', headers=self.headers, json={'planCode': 'ULTRA'})
         plan = self.client.get('/active-plan', headers=self.headers).json()
         self.assertEqual(len(plan['models']), 6)
         self.assertEqual(plan['creditsUsed'], 3)
 
-    def test_notebook_models(self):
-        self.assertEqual(_row({'additions': 12})['total_lines_added'], 12)
-        for key in ('model-1', 'model-2', 'model-3', 'model-4', 'model-5', 'model-6'):
-            with self.subTest(model=key):
-                score, _, _ = predict({'additions': 12, 'changedFiles': 2, 'language': 'Python'}, key)
-                self.assertGreaterEqual(score, 0)
-                self.assertLessEqual(score, 100)
-        with self.assertRaises(ValueError):
-            predict({'additions': 12}, 'missing-model')
+    def test_prediction_dev_and_types(self):
+        for prediction_type in ('BOTH', 'PR_QUALITY', 'MERGE_PROBABILITY'):
+            with self.subTest(prediction_type=prediction_type), patch.object(backend, 'analyze_pr', return_value=ANALYSIS):
+                body = {'pullRequestUrl': ANALYSIS['pr_url'], 'predictionType': prediction_type}
+                for route, headers in [('/predict-dev', {}), ('/predict', self.headers)]:
+                    response = self.client.post(route, json=body, headers=headers)
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.json()['mergeProbability'], None if prediction_type == 'PR_QUALITY' else 95)
+                    self.assertEqual(response.json()['qualityScore'], None if prediction_type == 'MERGE_PROBABILITY' else 92)
+                    self.assertEqual(response.json()['analysis'], ANALYSIS['analysis'])
+        self.assertEqual(self.client.get('/active-plan', headers=self.headers).json()['creditsUsed'], 3)
+        self.assertEqual(len(self.client.get('/history', headers=self.headers).json()), 3)
+        with patch.object(backend, 'analyze_pr', return_value=ANALYSIS):
+            self.assertEqual(self.client.post('/predict-dev', json=ANALYSIS['pr_url']).status_code, 200)
+        self.assertEqual(self.client.post('/predict', json=ANALYSIS['pr_url']).status_code, 401)
 
-    def test_github_features(self):
-        responses = [
-            {'title': 'Fix login', 'body': 'Add regression test', 'additions': 12,
-             'deletions': 3, 'changed_files': 2, 'commits': 1},
-            {'stargazers_count': 10, 'forks_count': 4, 'language': 'Python'},
-            [{'status': 'added'}, {'status': 'modified'}],
-        ]
-        with patch.object(github_api, 'urlopen', side_effect=[io.BytesIO(json.dumps(item).encode()) for item in responses]):
-            _, _, features = github_api.get_pull_request('https://github.com/owner/repo/pull/12')
-        self.assertEqual(features['total_lines_added'], 12)
-        self.assertEqual(features['files_added'], 1)
-        self.assertEqual(features['title_word_count'], 2)
+    def test_failed_analysis_does_not_save_or_charge(self):
+        for code in (401, 404, 422, 502, 503, 504):
+            with self.subTest(code=code), patch.object(backend, 'analyze_pr', side_effect=HTTPException(code, 'Service failed')):
+                for route, headers in [('/predict-dev', {}), ('/predict', self.headers)]:
+                    response = self.client.post(route, json=ANALYSIS['pr_url'], headers=headers)
+                    self.assertEqual(response.status_code, code)
+        self.assertEqual(self.client.get('/active-plan', headers=self.headers).json()['creditsUsed'], 0)
+        self.assertEqual(self.client.get('/history', headers=self.headers).json(), [])
+        with self.sessions() as db:
+            self.assertEqual(db.query(PredictionResult).count(), 0)
+            self.assertEqual(db.query(Repository).count(), 0)
 
+    def test_url_aliases_and_bad_inputs(self):
+        with patch.object(backend, 'analyze_pr', return_value=ANALYSIS):
+            for field in ('pullRequestUrl', 'pr_url', 'pull_request_url'):
+                self.assertEqual(self.client.post('/predict-dev', json={field: ANALYSIS['pr_url']}).status_code, 200)
+        with patch.object(backend, 'analyze_pr') as service:
+            for body in ('', ' ', {}, {'features': {}}, {'pr_url': None}, {'pr_url': ANALYSIS['pr_url'], 'unexpected': True}):
+                for route, headers in [('/predict-dev', {}), ('/predict', self.headers)]:
+                    self.assertEqual(self.client.post(route, headers=headers, json=body).status_code, 422)
+            service.assert_not_called()
+
+    def test_old_history_still_loads(self):
+        with patch.object(backend, 'analyze_pr', return_value=ANALYSIS):
+            self.client.post('/predict', json=ANALYSIS['pr_url'], headers=self.headers)
+        with self.sessions() as db:
+            result = db.query(PredictionResult).one()
+            result.analysis_response = None
+            db.add(PredictionFeature(prediction_id=result.prediction_id, feature_name='total_commits', value_type='NUMBER', value_number=1, source='GITHUB'))
+            db.commit()
+        # Reproduce the previous schema and run the startup migration twice.
+        with self.engine.begin() as connection:
+            connection.execute(text('ALTER TABLE prediction_results DROP COLUMN analysis_response'))
+        backend.migrate_schema()
+        backend.migrate_schema()
+        data = self.client.get('/history', headers=self.headers).json()[0]
+        self.assertEqual(data['mergeProbability'], 95)
+        self.assertEqual(data['features'], {'total_commits': 1.0})
+        self.assertEqual(data['pullRequest']['number'], 12)
 
     def test_change_password_for_user_and_admin(self):
         for username, headers in [('tester', self.headers), ('admin', self.admin)]:

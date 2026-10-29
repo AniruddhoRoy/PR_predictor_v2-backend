@@ -5,7 +5,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean, Column, Date, DateTime, ForeignKey, Integer, Numeric, String,
-    Table, Text, UniqueConstraint,
+    JSON, Table, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 
@@ -201,6 +201,7 @@ class PredictionResult(Base):
     quality_score = Column(Numeric(5, 2), nullable=True)
     quality_label = Column(String(30), nullable=True)
     recommendation = Column(Text, nullable=False)
+    analysis_response = Column(JSON, nullable=True)
     generated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     prediction = relationship("Prediction", back_populates="result")
     factors = relationship("PredictionFactor", back_populates="result", cascade="all, delete-orphan", order_by="PredictionFactor.display_order")

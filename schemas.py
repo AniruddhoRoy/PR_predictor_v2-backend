@@ -8,7 +8,7 @@
 
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class RegisterRequest(BaseModel):
@@ -52,7 +52,7 @@ class SubscriptionUpdate(BaseModel):
 
 
 class PredictionRequest(BaseModel):
-    pull_request_url: str = Field(min_length=1, alias="pullRequestUrl")
+    pull_request_url: str = Field(min_length=1, alias="pullRequestUrl", validation_alias=AliasChoices("pullRequestUrl", "pr_url", "pull_request_url"))
     prediction_type: str = Field(default="BOTH", alias="predictionType")
     model_id: Optional[str] = Field(default=None, alias="modelId")
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
