@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 venv/
 .env
+task.md
 
 # Local database and model artifacts
 *.db
