@@ -5,6 +5,7 @@ request -> call the hosted analyzer -> save result and charge credits.
 """
 
 import os
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -13,7 +14,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, inspect, or_, text
+from sqlalchemy import MetaData, func, inspect, or_
 from sqlalchemy.orm import Session
 
 from auth import create_token, hash_password, read_token, verify_password
@@ -50,89 +51,113 @@ def startup_event():
     migrate_schema()
     seed_database()
 
-# ! ############################################ Ignore it [Start] #############################################################
-
 def migrate_schema():
-    """Add the few new columns when an older local SQLite database is reused."""
-    additions = {
-        "plans": {"monthly_credits": "INTEGER DEFAULT 5", "parent_plan_id": "VARCHAR(36)"},
-        "models": {"credit_cost": "INTEGER DEFAULT 1", "artifact_key": "VARCHAR(80)"},
-        "usage_periods": {"credits_used": "INTEGER DEFAULT 0", "credit_limit_snapshot": "INTEGER DEFAULT 5"},
-        "predictions": {"credits_cost": "INTEGER DEFAULT 1", "inference_key": "VARCHAR(80)"},
-        "prediction_results": {"analysis_response": "JSON"},
-    }
-    existing = inspect(engine)
-    with engine.begin() as connection:
-        for table, columns in additions.items():
-            names = {item["name"] for item in existing.get_columns(table)}
-            for name, definition in columns.items():
-                if name not in names:
-                    connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {definition}"))
-                    if name == "monthly_credits":
-                        connection.execute(text("UPDATE plans SET monthly_credits = COALESCE(monthly_prediction_limit, 5)"))
-                    elif name == "credits_used":
-                        connection.execute(text("UPDATE usage_periods SET credits_used = predictions_used"))
+    """Upgrade the old SQLite tables once, keeping users and prediction history."""
+    if "monthly_credits" not in {column["name"] for column in inspect(engine).get_columns("plans")}:
+        return
+    if engine.dialect.name != "sqlite":
+        raise RuntimeError("The legacy migration supports SQLite. Use a new database for the new MySQL schema.")
+    with engine.connect() as connection:
+        foreign_keys = connection.exec_driver_sql("PRAGMA foreign_keys").scalar()
+        connection.commit()
+        connection.exec_driver_sql("PRAGMA foreign_keys = OFF")
+        connection.commit()
+        try:
+            connection.exec_driver_sql("BEGIN")
+            old = MetaData()
+            old.reflect(bind=connection)
+            rows = {name: [dict(row) for row in connection.execute(table.select()).mappings()]
+                    for name, table in old.tables.items()}
+            plans = {row["plan_id"]: row for row in rows["plans"]}
+            access = {(row["plan_id"], row["model_id"]) for row in rows["plan_model_access"]}
+            for plan in plans.values():
+                plan["credits"] = plan.get("monthly_credits", plan.get("monthly_prediction_limit")) or 0
+                plan["duration"] = 30  # Existing monthly plans keep a 30-day allowance.
+                parent = plan.get("parent_plan_id")
+                seen = {plan["plan_id"]}
+                while parent and parent not in seen:
+                    seen.add(parent)
+                    access.update((plan["plan_id"], model) for owner, model in list(access) if owner == parent)
+                    parent = plans[parent].get("parent_plan_id")
+            rows["plan_model_access"] = [{"plan_id": plan, "model_id": model} for plan, model in access]
+            for model in rows["models"]:
+                model["provider"] = "gemini-api" if model.get("provider") == "notebook" else model.get("provider") or "local"
+                model.setdefault("credit_cost", 1)
+            for subscription in rows["subscriptions"]:
+                if subscription["ended_at"] is None:
+                    subscription["ended_at"] = subscription["started_at"] + timedelta(days=plans[subscription["plan_id"]]["duration"])
+            for usage in rows["usage_periods"]:
+                usage["time_stamp"] = datetime.combine(usage["period_start"], datetime.min.time())
+                usage["credits_used"] = usage.get("credits_used", usage.get("predictions_used", 0))
+                active = [sub for sub in rows["subscriptions"] if sub["user_id"] == usage["user_id"]
+                          and sub["status"] == "ACTIVE" and usage["period_start"] <= sub["started_at"].date() <= usage["period_end"]]
+                if active:
+                    usage["time_stamp"] = max(sub["started_at"] for sub in active)
+            pull_requests = {row["pull_request_id"]: row for row in rows.get("pull_requests", [])}
+            inputs = {row["prediction_id"]: row for row in rows.get("prediction_inputs", [])}
+            results = {row["prediction_id"]: row for row in rows["prediction_results"]}
+            for prediction in rows["predictions"]:
+                pr = pull_requests.get(prediction.get("pull_request_id"), {})
+                result = results.get(prediction["prediction_id"], {})
+                response = result.get("analysis_response") or {}
+                prediction["pr_url"] = response.get("pr_url") or pr.get("url") or inputs.get(prediction["prediction_id"], {}).get("github_url")
+                prediction["title"] = response.get("features", {}).get("title") or pr.get("title") or "Pull request"
+                prediction.setdefault("credits_cost", 1)
+                if not response:
+                    features = {}
+                    for feature in rows.get("prediction_features", []):
+                        if feature["prediction_id"] == prediction["prediction_id"]:
+                            value = feature["value_number"] if feature["value_type"] == "NUMBER" else feature["value_boolean"] if feature["value_type"] == "BOOLEAN" else feature["value_text"]
+                            features[feature["feature_name"]] = float(value) if feature["value_type"] == "NUMBER" and value is not None else value
+                    features.update(title=prediction["title"], state=pr.get("state"), author=pr.get("author_login"))
+                    result["analysis_response"] = {"pr_url": prediction["pr_url"], "features": features, "analysis": {
+                        "merge_probability": float(result["merge_probability"]) if result.get("merge_probability") is not None else None,
+                        "quality_score": float(result["quality_score"]) if result.get("quality_score") is not None else None,
+                        "quality": result.get("quality_label"), "summary": result.get("recommendation"),
+                    }}
+            # Rebuild only the application's tables. Old detail tables remain as an archive.
+            for table in reversed(Base.metadata.sorted_tables):
+                connection.exec_driver_sql(f'DROP TABLE "{table.name}"')
+            Base.metadata.create_all(connection)
+            for table in Base.metadata.sorted_tables:
+                for row in rows[table.name]:
+                    connection.execute(table.insert().values(**{key: value for key, value in row.items() if key in table.c}))
+            if connection.exec_driver_sql("PRAGMA foreign_key_check").first():
+                raise RuntimeError("Migration found a broken reference; changes were rolled back")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.exec_driver_sql(f"PRAGMA foreign_keys = {foreign_keys}")
+            connection.commit()
 
 
 def seed_database():
-    db = SessionLocal()
-    try:
+    """Create missing defaults without overwriting admin changes."""
+    with SessionLocal() as db:
         models = []
         for number in range(1, 7):
             code = f"model-{number}"
             model = db.query(MLModel).filter_by(code=code).first()
             if not model:
-                model = MLModel(code=code, name=f"Model {number}", task_type="BOTH", version="1.0",
-                                provider="gemini-api", credit_cost=1, description="Hosted Gemini PR analysis.")
+                model = MLModel(code=code, name=f"Model {number}", provider="gemini-api",
+                                description="Hosted Gemini PR analysis.")
                 db.add(model)
-            elif model.provider == "notebook":
-                # Keep existing plan assignments and prices when retiring local inference.
-                model.provider = "gemini-api"
-                model.artifact_key = None
-                model.description = "Hosted Gemini PR analysis."
-                if model.name.startswith(f"Model {number} - "):
-                    model.name = f"Model {number}"
             models.append(model)
-        db.flush()
-        plans = {}
-        new_plans = set()
-        for code, name, credits in [("FREE", "Free", 5), ("PLUS", "Plus", 30), ("PRO", "Pro", 100), ("ULTRA", "Ultra", 300)]:
-            plan = db.query(Plan).filter_by(code=code).first()
-            if not plan:
-                plan = Plan(code=code, name=name, monthly_credits=credits, monthly_prediction_limit=credits, description=f"{credits} credits each month")
-                db.add(plan)
-                new_plans.add(code)
-            else:
-                if plan.credits is None:
-                    plan.credits = credits
-            plans[code] = plan
-        db.flush()
-        for code in new_plans:
-            plan = plans[code]
-            if code == "FREE":
-                plan.models = models[:1]
-            elif code == "PLUS":
-                plan.models = models[:3]
-            elif code == "PRO":
-                plan.parent = plans["PLUS"]
-                plan.models = models[3:]
-            elif code == "ULTRA":
-                plan.parent = plans["PRO"]
-        # Keep the old demo plan usable for existing accounts.
-        old = db.query(Plan).filter_by(code="PREMIUM").first()
-        if old and old.monthly_credits is None:
-            old.monthly_credits = 100
-        admin = db.query(User).filter_by(username="admin").first()
-        if not admin:
-            admin = User(username="admin", email="admin@example.com", full_name="Project Admin", role="ADMIN", password_hash=hash_password(os.getenv("ADMIN_PASSWORD", "1234")))
-            db.add(admin)
-            db.flush()
-            db.add(UserSetting(user_id=admin.user_id))
+        for code, name, credits, duration, count in [
+            ("FREE", "Free", 5, 1, 1), ("PLUS", "Plus", 30, 30, 3),
+            ("PRO", "Pro", 100, 30, 6), ("ULTRA", "Ultra", 300, 30, 6),
+        ]:
+            if not db.query(Plan).filter_by(code=code).first():
+                db.add(Plan(code=code, name=name, credits=credits, duration=duration,
+                            description=f"{credits} credits for {duration} days", models=models[:count]))
+        if not db.query(User).filter_by(username="admin").first():
+            db.add(User(username="admin", email="admin@example.com", full_name="Project Admin", role="ADMIN",
+                        password_hash=hash_password(os.getenv("ADMIN_PASSWORD", "1234")), settings=UserSetting()))
         db.commit()
-    finally:
-        db.close()
 
-# ! ############################################ Ignore it [End] #############################################################
+
 @app.get("/")
 def home():
     return {"message": "PR Predictor API is running", "docs": "/docs", "admin": "/admin/"}
@@ -300,11 +325,23 @@ def models(prediction_type: Optional[str] = Query(default=None, alias="predictio
         if prediction_type not in ALLOWED_PREDICTION_TYPES:
             raise HTTPException(400, "Invalid predictionType")
     return [_model_dict(item) for item in query.order_by(MLModel.name).all()]
-
+def _iso(value: Optional[datetime]) -> Optional[str]:
+    """Datetime -> ISO string, or None (for nullable columns like ended_at)."""
+    return value.isoformat() if value is not None else None
 
 def _model_dict(model: MLModel) -> dict:
-    return {"modelId": model.model_id, "code": model.code, "name": model.name, "version": model.version, "provider": model.provider, "description": model.description, "creditCost": model.credit_cost}
-
+    return {
+        "modelId": model.model_id,
+        "code": model.code,
+        "name": model.name,
+        "version": model.version,
+        "provider": model.provider,
+        "description": model.description,        # nullable
+        "creditCost": model.credit_cost,
+        "active": model.active,
+        "createdAt": _iso(model.created_at),
+        "retiredAt": _iso(model.retired_at),      # nullable
+    }
 
 @app.get("/subscription")
 def get_subscription(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -368,66 +405,82 @@ def _active_subscription(db: Session, user: User) -> Subscription:
     return subscription
 
 
+
+
 def _subscription_dict(subscription: Subscription) -> dict:
-    return {"subscriptionId": subscription.subscription_id, "status": subscription.status,
-            "startedAt": subscription.started_at.isoformat(), "endedAt": subscription.ended_at.isoformat(),
-            "plan": _plan_dict(subscription.plan)}
-
-
-def _plan_dict(plan: Plan) -> dict:
-    return {"planId": plan.plan_id, "code": plan.code, "name": plan.name,
-            "credits": plan.credits, "duration": plan.duration, "description": plan.description,
-            "models": [_model_dict(model) for model in sorted(plan.models, key=lambda item: item.name.lower())]}
-
-
-def _prediction_request(body: PredictionRequest | str) -> PredictionRequest:
-    if isinstance(body, str) and not body.strip():
-        raise HTTPException(422, "A GitHub pull request URL is required")
-    data = PredictionRequest(pullRequestUrl=body) if isinstance(body, str) else body
-    data.prediction_type = data.prediction_type.upper()
-    if data.prediction_type not in ALLOWED_PREDICTION_TYPES:
-        raise HTTPException(400, "predictionType must be MERGE_PROBABILITY, PR_QUALITY, or BOTH")
-    return data
-
-
-def _analysis_fields(response: dict, prediction_type: str) -> dict:
-    """Map analyzer fields for database storage and history records."""
-    features, analysis = response["features"], response["analysis"]
-    owner, name, _, number = response["pr_url"].rstrip("/").split("/")[3:]
     return {
-        "repository": {"owner": owner, "name": name, "url": f"https://github.com/{owner}/{name}"},
-        "pullRequest": {"number": int(number), "url": response["pr_url"],
-                        "title": features.get("title") or f"Pull request #{number}",
-                        "state": "MERGED" if features.get("merged") else (features.get("state") or "open").upper(),
-                        "authorLogin": features.get("author")},
-        "features": features,
-        "mergeProbability": None if prediction_type == "PR_QUALITY" else analysis["merge_probability"],
-        "qualityScore": None if prediction_type == "MERGE_PROBABILITY" else analysis["quality_score"],
-        "qualityLabel": analysis["quality"],
-        "recommendation": analysis["summary"],
-        "analysis": analysis,
-        "probabilityNote": response.get("probability_note"),
+        "subscriptionId": subscription.subscription_id,
+        "userId": subscription.user_id,
+        "planId": subscription.plan_id,
+        "status": subscription.status,
+        "startedAt": (subscription.started_at),
+        "endedAt": (subscription.ended_at),   
+        "createdAt": (subscription.created_at),
+        "plan": _plan_dict(subscription.plan),
     }
 
 
+def _plan_dict(plan: Plan) -> dict:
+    return {
+        "planId": plan.plan_id,
+        "code": plan.code,
+        "name": plan.name,
+        "credits": plan.credits,
+        "duration": plan.duration,                   # days
+        "description": plan.description,
+        "active": plan.active,
+        "models": [
+            _model_dict(model)
+            for model in sorted(plan.models, key=lambda item: item.name.lower())
+        ],
+    }
+
+PR_URL_RE = re.compile(r"^https://github\.com/[^/\s]+/[^/\s]+/pull/\d+/?$")
+
+
+def _prediction_request(body: PredictionRequest) -> PredictionRequest:
+    if not PR_URL_RE.match(body.pull_request_url):
+        raise HTTPException(422, "Enter a valid GitHub pull request URL")
+    return body
+
+
+#! def _analysis_fields(response: dict, prediction_type: str) -> dict:
+#     """Map analyzer fields for database storage and history records."""
+#     features, analysis = response["features"], response["analysis"]
+#     owner, name, _, number = response["pr_url"].rstrip("/").split("/")[3:]
+#     return {
+#         "repository": {"owner": owner, "name": name, "url": f"https://github.com/{owner}/{name}"},
+#         "pullRequest": {"number": int(number), "url": response["pr_url"],
+#                         "title": features.get("title") or f"Pull request #{number}",
+#                         "state": "MERGED" if features.get("merged") else (features.get("state") or "open").upper(),
+#                         "authorLogin": features.get("author")},
+#         "features": features,
+#         "mergeProbability": None if prediction_type == "PR_QUALITY" else analysis["merge_probability"],
+#         "qualityScore": None if prediction_type == "MERGE_PROBABILITY" else analysis["quality_score"],
+#         "qualityLabel": analysis["quality"],
+#         "recommendation": analysis["summary"],
+#         "analysis": analysis,
+#         "probabilityNote": response.get("probability_note"),
+#     }
+
+
 @app.post("/predict-dev")
-def predict_dev(body: PredictionRequest | str = Body(...)):
+def predict_dev(body: PredictionRequest):
     """Call the same service without login, credit charging, or saved history."""
     data = _prediction_request(body)
     return analyze_pr(data.pull_request_url)
 
 
 @app.post("/predict")
-def predict(body: PredictionRequest | str = Body(...), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def predict(body: PredictionRequest , user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     request_data = _prediction_request(body)
-    prediction_type = request_data.prediction_type
     subscription = _active_subscription(db, user)
     plan = subscription.plan
     model = _choose_model(db, request_data.model_id, plan)
     usage = _get_usage(db, subscription)
     if usage.credits_used + model.credit_cost > plan.credits:
         raise HTTPException(status_code=429, detail="Not enough credits for this model")
-    # Release the database write lock while the external service is working.
+    #! Release the database write lock while the external service is working.
     db.commit()
     response = analyze_pr(request_data.pull_request_url)
     fields = _analysis_fields(response, prediction_type)
@@ -456,21 +509,35 @@ def predict(body: PredictionRequest | str = Body(...), user: User = Depends(get_
     return response
 
 
-def _choose_model(db: Session, model_id: Optional[str], plan: Plan) -> MLModel:
+# def _choose_model(db: Session, model_id: str, plan: Plan) -> MLModel:
+#     allowed = plan.models
+#     allowed_ids = {item.model_id for item in allowed}
+#     query = db.query(MLModel).filter(MLModel.active.is_(True), MLModel.model_id.in_(allowed_ids))
+#     if model_id:
+#         key = model_id.strip().lower()
+#         model = query.filter(or_(MLModel.model_id == model_id, MLModel.code == key)).first()
+#         if model:
+#             return model
+#         if db.query(MLModel).filter(MLModel.active.is_(True), or_(MLModel.model_id == model_id, MLModel.code == key)).first():
+#             raise HTTPException(status_code=403, detail="Your active plan does not include this model")
+#         raise HTTPException(status_code=404, detail="Prediction model not found")
+#     model = query.order_by(MLModel.created_at).first()
+#     if not model:
+#         raise HTTPException(status_code=404, detail="Your active plan has no active model")
+#     return model
+
+def _choose_model(db: Session, model_id: str, plan: Plan) -> MLModel:
     allowed = plan.models
+    #! item.model_id is not recognized as a field in the MLModel model
     allowed_ids = {item.model_id for item in allowed}
     query = db.query(MLModel).filter(MLModel.active.is_(True), MLModel.model_id.in_(allowed_ids))
-    if model_id:
-        key = model_id.strip().lower()
-        model = query.filter(or_(MLModel.model_id == model_id, MLModel.code == key)).first()
-        if model:
-            return model
-        if db.query(MLModel).filter(MLModel.active.is_(True), or_(MLModel.model_id == model_id, MLModel.code == key)).first():
-            raise HTTPException(status_code=403, detail="Your active plan does not include this model")
-        raise HTTPException(status_code=404, detail="Prediction model not found")
-    model = query.order_by(MLModel.created_at).first()
+    
+    model = query.filter(MLModel.model_id == model_id).first()
+    model_exist = db.query(MLModel).filter(MLModel.model_id == model_id , MLModel.active.is_(True)).first()
+    if not model_exist:
+        raise HTTPException(status_code=404, detail="Model not found")
     if not model:
-        raise HTTPException(status_code=404, detail="Your active plan has no active model")
+        raise HTTPException(status_code=403, detail="Your active plan does not include this model")
     return model
 
 
@@ -521,7 +588,11 @@ def _prediction_dict(prediction: Prediction) -> dict:
         "recommendation": result.recommendation if result else None,
     }
     if result and result.analysis_response:
-        data.update(_analysis_fields(result.analysis_response, prediction.prediction_type))
+        response = result.analysis_response
+        if response.get("pr_url"):
+            data.update(_analysis_fields(response, prediction.prediction_type))
+        else:
+            data.update(features=response.get("features", {}), analysis=response.get("analysis", {}))
     return data
 
 

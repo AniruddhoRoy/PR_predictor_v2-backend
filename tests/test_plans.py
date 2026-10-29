@@ -1,10 +1,11 @@
 import os
 import unittest
 from copy import deepcopy
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 os.environ['DATABASE_URL'] = 'sqlite://'
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import sessionmaker
 from fastapi.testclient import TestClient
@@ -59,7 +60,108 @@ class CreditPlansTest(unittest.TestCase):
         with self.sessions() as db:
             plan = db.query(Plan).filter_by(code='PLUS').one()
             self.assertEqual(plan.credits, 0)
+            self.assertEqual(plan.duration, 7)
             self.assertEqual([m.code for m in plan.models], ['model-4'])
+
+    def test_subscription_duration_expiry_and_same_plan(self):
+        subscription = self.client.get('/subscription', headers=self.headers).json()
+        self.assertEqual(datetime.fromisoformat(subscription['endedAt']) - datetime.fromisoformat(subscription['startedAt']), timedelta(days=1))
+        with patch.object(backend, 'analyze_pr', return_value=ANALYSIS):
+            self.client.post('/predict', json=ANALYSIS['pr_url'], headers=self.headers)
+        same = self.client.post('/subscription', headers=self.headers, json={'planCode': 'FREE'}).json()
+        self.assertEqual(same['subscriptionId'], subscription['subscriptionId'])
+        self.assertEqual(self.client.get('/active-plan', headers=self.headers).json()['creditsUsed'], 1)
+        with self.sessions() as db:
+            saved = db.get(Subscription, subscription['subscriptionId'])
+            saved.ended_at = datetime.utcnow() - timedelta(seconds=1)
+            db.commit()
+        renewed = self.client.get('/subscription', headers=self.headers).json()
+        self.assertNotEqual(renewed['subscriptionId'], subscription['subscriptionId'])
+        self.assertEqual(self.client.get('/active-plan', headers=self.headers).json()['creditsUsed'], 0)
+        self.assertEqual(len(self.client.get('/history', headers=self.headers).json()), 1)
+        with self.sessions() as db:
+            self.assertEqual(db.get(Subscription, subscription['subscriptionId']).status, 'EXPIRED')
+
+    def test_expiry_during_analysis_does_not_charge(self):
+        subscription = self.client.get('/subscription', headers=self.headers).json()
+        def analyze(url):
+            with self.sessions() as db:
+                saved = db.get(Subscription, subscription['subscriptionId'])
+                saved.ended_at = datetime.utcnow() - timedelta(seconds=1)
+                db.commit()
+            return ANALYSIS
+        with patch.object(backend, 'analyze_pr', side_effect=analyze):
+            response = self.client.post('/predict', json=ANALYSIS['pr_url'], headers=self.headers)
+        self.assertEqual(response.status_code, 409)
+        with self.sessions() as db:
+            self.assertEqual(db.query(Prediction).count(), 0)
+            self.assertEqual(db.query(UsagePeriod).one().credits_used, 0)
+
+    def test_admin_plan_and_model_fields(self):
+        model = self.client.post('/admin/api/models', headers=self.admin, json={
+            'code': 'custom-model', 'name': 'Custom', 'version': '1.0', 'creditCost': 2,
+        })
+        self.assertEqual(model.status_code, 201)
+        self.assertNotIn('taskType', model.json())
+        self.assertNotIn('artifactKey', model.json())
+        plan = self.client.post('/admin/api/plans', headers=self.admin, json={
+            'code': 'CUSTOM', 'name': 'Custom', 'credits': 10, 'duration': 7, 'modelCodes': ['custom-model'],
+        })
+        self.assertEqual(plan.status_code, 201)
+        self.assertEqual(plan.json()['duration'], 7)
+        self.assertEqual([m['code'] for m in plan.json()['models']], ['custom-model'])
+        subscription = self.client.post('/subscription', headers=self.headers, json={'planCode': 'CUSTOM'}).json()
+        self.assertEqual(datetime.fromisoformat(subscription['endedAt']) - datetime.fromisoformat(subscription['startedAt']), timedelta(days=7))
+        free = next(p for p in self.client.get('/plans', headers=self.headers).json() if p['code'] == 'FREE')
+        for payload, code in [({'duration': 0}, 422), ({'duration': None}, 422), ({'credits': -1}, 422), ({'active': False}, 400), ({'code': 'OTHER'}, 400)]:
+            self.assertEqual(self.client.patch('/admin/api/plans/' + free['planId'], headers=self.admin, json=payload).status_code, code)
+
+    def test_legacy_migration_preserves_data_and_is_repeatable(self):
+        with patch.object(backend, 'analyze_pr', return_value=ANALYSIS):
+            self.client.post('/predict', json=ANALYSIS['pr_url'], headers=self.headers)
+        with self.engine.begin() as connection:
+            connection.execute(text('ALTER TABLE plans RENAME COLUMN credits TO monthly_credits'))
+            connection.execute(text('ALTER TABLE plans DROP COLUMN duration'))
+            connection.execute(text('ALTER TABLE plans ADD COLUMN parent_plan_id VARCHAR(36)'))
+            connection.execute(text("UPDATE plans SET parent_plan_id = (SELECT plan_id FROM plans WHERE code = 'PLUS') WHERE code = 'PRO'"))
+            connection.execute(text("DELETE FROM plan_model_access WHERE plan_id = (SELECT plan_id FROM plans WHERE code = 'PRO')"))
+            connection.execute(text('ALTER TABLE models ADD COLUMN task_type VARCHAR(30)'))
+            connection.execute(text('ALTER TABLE predictions DROP COLUMN pr_url'))
+            connection.execute(text('ALTER TABLE predictions DROP COLUMN title'))
+            connection.execute(text('ALTER TABLE usage_periods RENAME TO old_usage'))
+            connection.execute(text('CREATE TABLE usage_periods (usage_period_id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36), period_start DATE, period_end DATE, credits_used INTEGER)'))
+            connection.execute(text("INSERT INTO usage_periods SELECT usage_period_id, user_id, date(time_stamp, 'start of month'), date(time_stamp, 'start of month', '+1 month', '-1 day'), credits_used FROM old_usage"))
+            connection.execute(text('DROP TABLE old_usage'))
+            connection.execute(text("UPDATE subscriptions SET ended_at = NULL WHERE status = 'ACTIVE'"))
+        backend.migrate_schema()
+        backend.seed_database()
+        backend.migrate_schema()
+        backend.seed_database()
+        with self.sessions() as db:
+            self.assertEqual(db.query(User).count(), 2)
+            self.assertEqual(db.query(PredictionResult).one().analysis_response, ANALYSIS)
+            self.assertEqual(db.query(Prediction).one().pr_url, ANALYSIS['pr_url'])
+            self.assertEqual(db.query(Plan).filter_by(code='FREE').one().credits, 5)
+            pro = db.query(Plan).filter_by(code='PRO').one()
+            self.assertEqual(sorted(m.code for m in pro.models), ['model-1', 'model-2', 'model-3'])
+        self.assertEqual(self.client.get('/active-plan', headers=self.headers).json()['creditsUsed'], 1)
+        self.assertEqual(len(self.client.get('/history', headers=self.headers).json()), 1)
+
+    def test_migration_failure_rolls_back_schema_and_data(self):
+        with self.engine.begin() as connection:
+            connection.execute(text('ALTER TABLE plans RENAME COLUMN credits TO monthly_credits'))
+        def fail_on_drop(connection, cursor, statement, parameters, context, executemany):
+            if statement.startswith('DROP TABLE'):
+                raise RuntimeError('Simulated migration failure')
+        event.listen(self.engine, 'before_cursor_execute', fail_on_drop)
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'Simulated migration failure'):
+                backend.migrate_schema()
+        finally:
+            event.remove(self.engine, 'before_cursor_execute', fail_on_drop)
+        self.assertIn('monthly_credits', {column['name'] for column in inspect(self.engine).get_columns('plans')})
+        with self.engine.connect() as connection:
+            self.assertEqual(connection.execute(text('SELECT COUNT(*) FROM users')).scalar(), 2)
 
     def test_access_cost_and_failure(self):
         body = {'pullRequestUrl': 'https://github.com/owner/repo/pull/12', 'predictionType': 'BOTH', 'modelId': 'model-4'}
