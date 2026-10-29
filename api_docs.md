@@ -726,7 +726,7 @@ One history item (nullable feature fields omitted here for readability):
 }
 ```
 
-Both scores are stored for every successful prediction. `features.number` comes from pr_number; `features.created_at` and `features.updated_at` come from pr_created_at and pr_updated_at. Feature lists and analysis recommendations are stored as JSON. `predictionId` is the local ID used by the detail route.
+Both scores are stored for every successful prediction. `features.number` comes from pr_number; `features.created_at` and `features.updated_at` come from pr_created_at and pr_updated_at. PR created_at and updated_at timestamps are converted to UTC before storage and returned without a timezone suffix. Timestamps without an offset are treated as UTC. The immediate POST response still preserves the analyzer values. Feature lists and analysis recommendations are stored as JSON. `predictionId` is the local ID used by the detail route.
 
 ### `GET /predictions/{predictionId}`
 

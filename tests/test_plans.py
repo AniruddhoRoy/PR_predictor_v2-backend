@@ -347,6 +347,23 @@ class CreditPlansTest(unittest.TestCase):
         self.assertEqual(self.client.get('/predictions?limit=0', headers=self.headers).status_code, 422)
         self.assertEqual(self.client.get('/predictions').status_code, 401)
 
+    def test_pr_timestamp_offsets_are_saved_as_utc(self):
+        for created, updated, expected_created, expected_updated in [
+            ('2026-10-01T00:30:00+06:00', '2026-10-02T22:30:00-04:00', '2026-09-30T18:30:00', '2026-10-03T02:30:00'),
+            ('2026-10-01T01:00:00Z', '2026-10-02T02:00:00+00:00', '2026-10-01T01:00:00', '2026-10-02T02:00:00'),
+            ('2026-10-01T01:00:00', None, '2026-10-01T01:00:00', None),
+        ]:
+            response = deepcopy(ANALYSIS)
+            response['features'].update(created_at=created, updated_at=updated)
+            with self.subTest(created=created), patch.object(backend, 'analyze_pr', return_value=response):
+                result = self.client.post('/predict', json=self.body, headers=self.headers)
+                self.assertEqual(result.status_code, 200)
+                self.assertEqual(result.json(), response)
+                item = self.client.get('/predictions', headers=self.headers).json()[0]
+                self.assertEqual(item['features']['created_at'], expected_created)
+                self.assertEqual(item['features']['updated_at'], expected_updated)
+                self.assertEqual(self.client.get('/predictions/' + item['predictionId'], headers=self.headers).json(), item)
+
     def test_result_columns_and_timestamps(self):
         response = deepcopy(ANALYSIS)
         response['features'].update(created_at='2026-10-01T01:02:03Z', updated_at='2026-10-02T01:02:03+00:00',

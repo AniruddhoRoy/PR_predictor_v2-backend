@@ -6,7 +6,7 @@ request -> call the hosted analyzer -> save result and charge credits.
 
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -481,7 +481,8 @@ def _result_values(response: dict) -> dict:
     try:
         for name in ("pr_created_at", "pr_updated_at"):
             if values[name] is not None:
-                values[name] = datetime.fromisoformat(values[name].replace("Z", "+00:00"))
+                timestamp = datetime.fromisoformat(values[name].replace("Z", "+00:00"))
+                values[name] = timestamp.astimezone(timezone.utc).replace(tzinfo=None) if timestamp.tzinfo else timestamp
     except (ValueError, AttributeError) as error:
         raise HTTPException(502, "Analysis service returned an invalid PR timestamp") from error
     return values
