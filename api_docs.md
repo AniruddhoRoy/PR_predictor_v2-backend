@@ -1181,7 +1181,7 @@ Required path userId: database UUID. Required body role: USER or ADMIN (string, 
 
 Authentication: **Admin**.
 
-No path/query parameters. Latest 100 prediction summaries across all users, newest first. username can be null when no related user is available. These are summaries rather than full prediction objects.
+No path/query parameters. Latest 100 prediction summaries across all users, newest first. username can be null when no related user is available. These are summaries rather than full prediction objects. The admin table shows User, Status, and Created; predictionType is no longer used.
 
 **Request body:** none.
 
