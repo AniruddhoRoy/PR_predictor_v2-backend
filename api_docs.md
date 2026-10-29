@@ -638,6 +638,8 @@ Both analyzer scores are saved. Read them from `analysis.merge_probability` and 
 | 503 | PR_ANALYZER_TOKEN not set, service configuration missing, service quota/rate limit, or service unavailable |
 | 504 | GitHub/Gemini timeout or analysis service timeout |
 
+Analyzer merged, draft, and mergeable fields must be JSON booleans or null when present; invalid values return 502 before credits are charged.
+
 Analyzer failures are saved as FAILED predictions with httpStatus and errorMessage, zero creditsCost, and no result. Local validation/access/credit failures do not create prediction records.
 
 ### `POST /predict-dev`

@@ -63,6 +63,9 @@ def analyze_pr(pr_url: str) -> dict:
         for key in ("title", "state", "author"):
             if features.get(key) is not None and not isinstance(features[key], str):
                 raise ValueError("Invalid PR metadata")
+        for key in ("merged", "draft", "mergeable"):
+            if features.get(key) is not None and type(features[key]) is not bool:
+                raise ValueError("Invalid PR Boolean")
     except (ValueError, KeyError, TypeError, AttributeError) as error:
         raise HTTPException(502, "Analysis service returned incomplete or invalid data") from error
     return result

@@ -59,6 +59,20 @@ class AnalysisApiTest(unittest.TestCase):
                     analysis_api.analyze_pr(ANALYSIS['pr_url'])
                 self.assertEqual(caught.exception.status_code, code)
 
+    def test_pr_booleans_are_validated(self):
+        for key in ('merged', 'draft', 'mergeable'):
+            for value in ('false', 'not-a-boolean', 0, 1, [], {}):
+                result = deepcopy(ANALYSIS)
+                result['features'][key] = value
+                with self.subTest(key=key, value=value), patch.object(analysis_api, 'urlopen', return_value=io.BytesIO(json.dumps(result).encode())):
+                    with self.assertRaises(HTTPException) as caught:
+                        analysis_api.analyze_pr(ANALYSIS['pr_url'])
+                    self.assertEqual(caught.exception.status_code, 502)
+            for value in (True, False, None):
+                result['features'][key] = value
+                with patch.object(analysis_api, 'urlopen', return_value=io.BytesIO(json.dumps(result).encode())):
+                    self.assertEqual(analysis_api.analyze_pr(ANALYSIS['pr_url']), result)
+
     def test_invalid_responses_are_rejected(self):
         bodies = [b'', b'<html>Error</html>', b'{}', b'[]']
         for value in (-1, 101, '95', None, True, float('nan')):

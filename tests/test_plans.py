@@ -1,5 +1,6 @@
 import os
 import json
+import io
 import unittest
 from copy import deepcopy
 from datetime import datetime, timedelta
@@ -11,6 +12,7 @@ from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import sessionmaker
 from fastapi.testclient import TestClient
 import app as backend
+import analysis_api
 from fastapi import HTTPException
 from auth import verify_password
 from database import Base
@@ -72,6 +74,18 @@ class CreditPlansTest(unittest.TestCase):
             response = self.client.patch('/settings', headers=self.headers, json={'notificationsEnabled': value})
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()['notificationsEnabled'], value)
+
+    def test_invalid_analyzer_boolean_is_saved_without_charge(self):
+        response = deepcopy(ANALYSIS)
+        response['features']['merged'] = 'not-a-boolean'
+        with patch.dict(os.environ, {'PR_ANALYZER_TOKEN': 'test-only-token'}), patch.object(analysis_api, 'urlopen', return_value=io.BytesIO(json.dumps(response).encode())):
+            result = self.client.post('/predict', headers=self.headers, json=self.body)
+        self.assertEqual(result.status_code, 502)
+        self.assertEqual(self.client.get('/active-plan', headers=self.headers).json()['creditsUsed'], 0)
+        with self.sessions() as db:
+            self.assertEqual(db.query(PredictionResult).count(), 0)
+            self.assertEqual(db.query(Prediction).one().http_status, 502)
+            self.assertEqual(db.query(Prediction).one().status, 'FAILED')
 
     def test_admin_changes_survive_restart(self):
         plans = self.client.get('/admin/api/plans', headers=self.admin).json()
