@@ -1,27 +1,22 @@
 # Entity Relationship Diagram
 
-Based on the current SQLAlchemy models in [models.py](models.py) and the prediction workflow in [app.py](app.py). All 14 tables and all their columns are shown, including fields retained for older data.
+Matches the 9 tables, 104 columns, and 11 foreign keys declared in [models.py](models.py), including the `plan_model_access` association table.
 
-`PK` = primary key, `FK` = foreign key, `UK` = unique key. Fields marked `nullable` can be empty; the other fields are required by the model. Composite keys and SQL types are detailed in [SCHEMA_DIAGRAM.md](SCHEMA_DIAGRAM.md).
+`PK` = primary key, `FK` = foreign key, `UK` = unique key. Fields marked `nullable` may be null; all other fields are required. Solid links include the parent key in the child primary key; dotted links use a separate child key. Exact SQL types and indexes are listed in [SCHEMA_DIAGRAM.md](SCHEMA_DIAGRAM.md).
 
 ```mermaid
 erDiagram
     USERS ||--o| USER_SETTINGS : has
-    USERS ||--o{ SUBSCRIPTIONS : owns
-    PLANS ||--o{ SUBSCRIPTIONS : defines
-    PLANS o|--o{ PLANS : parent_of
+    USERS ||..o{ SUBSCRIPTIONS : owns
+    PLANS ||..o{ SUBSCRIPTIONS : defines
     PLANS ||--o{ PLAN_MODEL_ACCESS : grants
     MODELS ||--o{ PLAN_MODEL_ACCESS : included_in
-    USERS ||--o{ USAGE_PERIODS : tracks
-    USERS ||--o{ PREDICTIONS : submits
-    USAGE_PERIODS ||--o{ PREDICTIONS : accounts_for
-    MODELS ||--o{ PREDICTIONS : prices
-    REPOSITORIES ||--o{ PULL_REQUESTS : contains
-    PULL_REQUESTS o|--o{ PREDICTIONS : analyzed_by
-    PREDICTIONS ||--o| PREDICTION_INPUTS : has_input
-    PREDICTIONS ||--o| PREDICTION_RESULTS : has_result
-    PREDICTIONS ||--o{ PREDICTION_FEATURES : has_legacy_features
-    PREDICTION_RESULTS ||--o{ PREDICTION_FACTORS : has_legacy_factors
+    USERS ||..o{ USAGE_PERIODS : tracks
+    USERS ||..o{ PREDICTIONS : submits
+    USAGE_PERIODS ||..o{ PREDICTIONS : accounts_for
+    MODELS ||..o{ PREDICTIONS : prices
+    PREDICTIONS ||..o| PREDICTION_RESULTS : has_result
+    USERS ||..o{ PREDICTION_RESULTS : owns_results
 
     USERS {
         string user_id PK
@@ -48,9 +43,8 @@ erDiagram
         string plan_id PK
         string code UK
         string name
-        integer monthly_prediction_limit "nullable; legacy count field"
-        integer monthly_credits "current monthly budget"
-        string parent_plan_id FK "nullable; inherits model access from this plan"
+        integer credits "credit allowance"
+        integer duration "duration in days"
         text description
         boolean active
     }
@@ -64,12 +58,10 @@ erDiagram
         string model_id PK
         string code UK
         string name
-        string task_type
         string version
-        string provider "nullable"
+        string provider
         text description "nullable"
         integer credit_cost "credits per successful prediction"
-        string artifact_key "nullable; legacy metadata; ignored by hosted analyzer"
         boolean active
         datetime created_at
         datetime retired_at "nullable"
@@ -81,41 +73,15 @@ erDiagram
         string plan_id FK
         string status
         datetime started_at
-        datetime ended_at "nullable"
-        string provider_reference "nullable"
+        datetime ended_at "required subscription end time"
         datetime created_at
     }
 
     USAGE_PERIODS {
         string usage_period_id PK
         string user_id FK
-        date period_start
-        date period_end
-        integer predictions_used
-        integer limit_snapshot "nullable; legacy count snapshot"
+        date time_stamp "date used for credit tracking"
         integer credits_used
-        integer credit_limit_snapshot "budget at last successful charge"
-    }
-
-    REPOSITORIES {
-        string repository_id PK
-        string provider
-        string owner
-        string name
-        text canonical_url
-        datetime created_at
-    }
-
-    PULL_REQUESTS {
-        string pull_request_id PK
-        string repository_id FK
-        integer number
-        text url UK
-        text title
-        string state
-        string author_login "nullable"
-        datetime fetched_at
-        datetime updated_at
     }
 
     PREDICTIONS {
@@ -123,64 +89,74 @@ erDiagram
         string user_id FK
         string usage_period_id FK
         string model_id FK
-        string pull_request_id FK "nullable"
-        string prediction_type
-        string status
-        string model_version
-        integer credits_cost "cost charged for this prediction"
-        string inference_key "nullable; gemini-api for new predictions"
+        text pr_url
+        string status "COMPLETED or FAILED"
+        integer credits_cost "actual charge; zero on analyzer failure"
         datetime created_at
         datetime completed_at "nullable"
+        integer http_status "nullable; analyzer status or mapped service error"
         text error_message "nullable"
-    }
-
-    PREDICTION_INPUTS {
-        string prediction_id PK, FK
-        string input_mode
-        text github_url "nullable"
-        text raw_feature_text "nullable; legacy manual input"
-        datetime submitted_at
     }
 
     PREDICTION_RESULTS {
         string result_id PK
         string prediction_id FK, UK
+        string user_id FK
+        text pr_url
+        string repository "owner/repository text; not a foreign key"
+        integer pr_number
+        text title
+        text description "nullable"
+        string author "nullable"
+        string author_association "nullable"
+        string state "nullable"
+        boolean merged "nullable"
+        boolean draft "nullable"
+        boolean mergeable "nullable"
+        string mergeable_state "nullable"
+        datetime pr_created_at "nullable; DateTime with timezone=True"
+        datetime pr_updated_at "nullable; DateTime with timezone=True"
+        string head_sha "nullable"
+        string base_branch "nullable"
+        integer additions "nullable"
+        integer deletions "nullable"
+        integer changed_files "nullable"
+        integer commit_count "nullable"
+        integer comment_count "nullable"
+        integer review_comment_count "nullable"
+        integer review_count "nullable"
+        integer approvals "nullable"
+        integer changes_requested "nullable"
+        json labels "nullable"
+        json files "nullable"
+        json comments "nullable"
+        json reviews "nullable"
+        json review_comments "nullable"
+        json commits "nullable"
+        json checks "nullable"
+        json statuses "nullable"
+        json warnings "nullable"
         decimal merge_probability "nullable"
         decimal quality_score "nullable"
-        string quality_label "nullable"
-        text recommendation
-        json analysis_response "nullable; complete hosted service response"
+        string quality "nullable"
+        string confidence "nullable"
+        text summary "nullable"
+        text merge_reasoning "nullable"
+        json recommendations "nullable"
+        json potential_improvements "nullable"
+        json limitations "nullable"
+        text probability_note "nullable"
         datetime generated_at
-    }
-
-    PREDICTION_FEATURES {
-        string feature_id PK
-        string prediction_id FK
-        string feature_name
-        string value_type
-        text value_text "nullable"
-        decimal value_number "nullable"
-        boolean value_boolean "nullable"
-        string source
-        datetime created_at
-    }
-
-    PREDICTION_FACTORS {
-        string factor_id PK
-        string result_id FK
-        string factor_name
-        text description
-        string impact
-        integer display_order
     }
 ```
 
 ## How the relationships are used
 
-- **Admin access:** an admin is a row in `users` with `role = ADMIN`. There is no separate admin table.
-- **Plan access:** `plan_model_access` assigns models directly to a plan. `plans.parent_plan_id` adds the parent plan's models, recursively. Inheritance changes model access, not the monthly credit budget.
-- **Credits:** each user has at most one `usage_periods` row per calendar month. A successful `/predict` request adds the chosen model's `credit_cost` to `credits_used` and records that cost in `predictions.credits_cost`. Switching plans keeps the month's existing usage.
-- **Analysis and history:** the backend calls the hosted `/analyze` service. It saves repository/PR metadata, a prediction, its input URL, and a result. `prediction_results.analysis_response` holds the complete response, including features, analysis, and `probability_note`. `/predict-dev` does not save records or charge credits.
-- **Older history:** `prediction_features` and `prediction_factors` remain for older predictions. New predictions store features and explanations in `analysis_response` instead. Models are catalog entries for access and cost; every entry uses the same hosted service.
+- **Users:** settings are optional one-to-one through `user_settings.user_id`. Users can have multiple subscriptions, usage records, predictions, and prediction results. Admin access comes from `users.role`.
+- **Plans and models:** plans grant access directly through `plan_model_access`. Each plan has `credits` and a `duration` in days. There is no parent-plan relationship.
+- **Subscriptions and usage:** `ended_at` is required. The application sets it from the start time and plan duration. Usage lookup uses the user and the subscription start date; `time_stamp` is a DATE. The database does not enforce uniqueness on that pair or link usage directly to a subscription.
+- **Predictions:** each prediction belongs to a user, a usage record, and a model. The PR URL is stored directly on the prediction. Analyzer failures are saved with `status = FAILED`, `http_status`, `error_message`, and zero credits charged.
+- **Results:** a prediction can have at most one result because `prediction_results.prediction_id` is unique. Successful analysis creates a result; failures do not. Results also have a direct foreign key to the user.
+- **Analyzer data:** PR metadata is stored in result columns; feature lists and recommendations use JSON columns. Scores, quality, confidence, summary, reasoning, and the probability note are also stored on the result. There is no `analysis_response` column.
 
-The optional one-to-one links reflect the database constraints: the schema permits a user without settings and a prediction without an input/result. The normal application workflow creates those rows. `predictions.pull_request_id` is nullable for compatibility with old records; new predictions always use a GitHub PR.
+There are no current models for repositories, pull requests, prediction inputs, prediction features, or prediction factors. Repository and PR details belong to `prediction_results`. `/predict-dev` does not save predictions or charge credits.

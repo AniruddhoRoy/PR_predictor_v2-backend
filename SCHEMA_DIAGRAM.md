@@ -1,80 +1,92 @@
 # Relational Schema Diagram
 
-This is the schema declared in [models.py](models.py). [database.py](database.py) uses SQLite by default or the configured `DATABASE_URL`. Startup creates missing tables and adds supported missing columns through `migrate_schema()` in [app.py](app.py).
+Matches the 9 tables, 104 columns, and 11 foreign keys declared in [models.py](models.py). [database.py](database.py) uses SQLite by default or the configured `DATABASE_URL`. This describes the current model schema; old SQLite databases may also retain archived tables after migration.
 
-`PK` = primary key, `FK` = foreign key, `UQ` = unique column. A `?` after a field name means it is nullable. Each arrow points from a foreign-key column to the referenced table's primary key. SQL types, lengths, and numeric precision come from the current model definitions.
+`PK` = primary key, `FK` = foreign key, `UQ` = unique column. A `?` means nullable. Each arrow points from a foreign-key column to its referenced primary key. Types, lengths, and numeric precision follow the SQLAlchemy declarations.
 
 ```mermaid
 flowchart LR
     users["users<br/>PK user_id : VARCHAR(36)<br/>UQ username : VARCHAR(80)<br/>UQ email : VARCHAR(255)<br/>password_hash : VARCHAR(255)<br/>full_name : VARCHAR(150)<br/>role : VARCHAR(20)<br/>github_profile_url? : TEXT<br/>created_at : DATETIME<br/>updated_at : DATETIME"]
     user_settings["user_settings<br/>PK/FK user_id : VARCHAR(36)<br/>theme_mode : VARCHAR(10)<br/>notifications_enabled : BOOLEAN<br/>default_prediction_type : VARCHAR(30)<br/>default_input_mode : VARCHAR(30)<br/>updated_at : DATETIME"]
-    plans["plans<br/>PK plan_id : VARCHAR(36)<br/>UQ code : VARCHAR(80)<br/>name : VARCHAR(150)<br/>monthly_prediction_limit? : INTEGER<br/>monthly_credits : INTEGER<br/>FK parent_plan_id? : VARCHAR(36)<br/>description : TEXT<br/>active : BOOLEAN"]
+    plans["plans<br/>PK plan_id : VARCHAR(36)<br/>UQ code : VARCHAR(80)<br/>name : VARCHAR(150)<br/>credits : INTEGER<br/>duration : INTEGER<br/>description : TEXT<br/>active : BOOLEAN"]
     plan_model_access["plan_model_access<br/>PK/FK plan_id : VARCHAR(36)<br/>PK/FK model_id : VARCHAR(36)"]
-    models["models<br/>PK model_id : VARCHAR(36)<br/>UQ code : VARCHAR(80)<br/>name : VARCHAR(150)<br/>task_type : VARCHAR(30)<br/>version : VARCHAR(80)<br/>provider? : VARCHAR(100)<br/>description? : TEXT<br/>credit_cost : INTEGER<br/>artifact_key? : VARCHAR(80)<br/>active : BOOLEAN<br/>created_at : DATETIME<br/>retired_at? : DATETIME"]
-    subscriptions["subscriptions<br/>PK subscription_id : VARCHAR(36)<br/>FK user_id : VARCHAR(36)<br/>FK plan_id : VARCHAR(36)<br/>status : VARCHAR(20)<br/>started_at : DATETIME<br/>ended_at? : DATETIME<br/>provider_reference? : VARCHAR(150)<br/>created_at : DATETIME"]
-    usage_periods["usage_periods<br/>PK usage_period_id : VARCHAR(36)<br/>FK user_id : VARCHAR(36)<br/>period_start : DATE<br/>period_end : DATE<br/>predictions_used : INTEGER<br/>limit_snapshot? : INTEGER<br/>credits_used : INTEGER<br/>credit_limit_snapshot : INTEGER"]
-    repositories["repositories<br/>PK repository_id : VARCHAR(36)<br/>provider : VARCHAR(50)<br/>owner : VARCHAR(100)<br/>name : VARCHAR(150)<br/>canonical_url : TEXT<br/>created_at : DATETIME"]
-    pull_requests["pull_requests<br/>PK pull_request_id : VARCHAR(36)<br/>FK repository_id : VARCHAR(36)<br/>number : INTEGER<br/>UQ url : TEXT<br/>title : TEXT<br/>state : VARCHAR(30)<br/>author_login? : VARCHAR(100)<br/>fetched_at : DATETIME<br/>updated_at : DATETIME"]
-    predictions["predictions<br/>PK prediction_id : VARCHAR(36)<br/>FK user_id : VARCHAR(36)<br/>FK usage_period_id : VARCHAR(36)<br/>FK model_id : VARCHAR(36)<br/>FK pull_request_id? : VARCHAR(36)<br/>prediction_type : VARCHAR(30)<br/>status : VARCHAR(20)<br/>model_version : VARCHAR(80)<br/>credits_cost : INTEGER<br/>inference_key? : VARCHAR(80)<br/>created_at : DATETIME<br/>completed_at? : DATETIME<br/>error_message? : TEXT"]
-    prediction_inputs["prediction_inputs<br/>PK/FK prediction_id : VARCHAR(36)<br/>input_mode : VARCHAR(30)<br/>github_url? : TEXT<br/>raw_feature_text? : TEXT<br/>submitted_at : DATETIME"]
-    prediction_results["prediction_results<br/>PK result_id : VARCHAR(36)<br/>FK/UQ prediction_id : VARCHAR(36)<br/>merge_probability? : NUMERIC(5, 2)<br/>quality_score? : NUMERIC(5, 2)<br/>quality_label? : VARCHAR(30)<br/>recommendation : TEXT<br/>analysis_response? : JSON<br/>generated_at : DATETIME"]
-    prediction_features["prediction_features<br/>PK feature_id : VARCHAR(36)<br/>FK prediction_id : VARCHAR(36)<br/>feature_name : VARCHAR(100)<br/>value_type : VARCHAR(20)<br/>value_text? : TEXT<br/>value_number? : NUMERIC(12, 2)<br/>value_boolean? : BOOLEAN<br/>source : VARCHAR(30)<br/>created_at : DATETIME"]
-    prediction_factors["prediction_factors<br/>PK factor_id : VARCHAR(36)<br/>FK result_id : VARCHAR(36)<br/>factor_name : VARCHAR(100)<br/>description : TEXT<br/>impact : VARCHAR(20)<br/>display_order : INTEGER"]
+    models["models<br/>PK model_id : VARCHAR(36)<br/>UQ code : VARCHAR(80)<br/>name : VARCHAR(150)<br/>version : VARCHAR(80)<br/>provider : VARCHAR(100)<br/>description? : TEXT<br/>credit_cost : INTEGER<br/>active : BOOLEAN<br/>created_at : DATETIME<br/>retired_at? : DATETIME"]
+    subscriptions["subscriptions<br/>PK subscription_id : VARCHAR(36)<br/>FK user_id : VARCHAR(36)<br/>FK plan_id : VARCHAR(36)<br/>status : VARCHAR(20)<br/>started_at : DATETIME<br/>ended_at : DATETIME<br/>created_at : DATETIME"]
+    usage_periods["usage_periods<br/>PK usage_period_id : VARCHAR(36)<br/>FK user_id : VARCHAR(36)<br/>time_stamp : DATE<br/>credits_used : INTEGER"]
+    predictions["predictions<br/>PK prediction_id : VARCHAR(36)<br/>FK user_id : VARCHAR(36)<br/>FK usage_period_id : VARCHAR(36)<br/>FK model_id : VARCHAR(36)<br/>pr_url : TEXT<br/>status : VARCHAR(20)<br/>credits_cost : INTEGER<br/>created_at : DATETIME<br/>completed_at? : DATETIME<br/>http_status? : INTEGER<br/>error_message? : TEXT"]
+    prediction_results["prediction_results<br/>PK result_id : VARCHAR(36)<br/>FK/UQ prediction_id : VARCHAR(36)<br/>FK user_id : VARCHAR(36)<br/>pr_url : TEXT<br/>repository : VARCHAR(255)<br/>pr_number : INTEGER<br/>title : TEXT<br/>description? : TEXT<br/>author? : VARCHAR(100)<br/>author_association? : VARCHAR(50)<br/>state? : VARCHAR(20)<br/>merged? : BOOLEAN<br/>draft? : BOOLEAN<br/>mergeable? : BOOLEAN<br/>mergeable_state? : VARCHAR(30)<br/>pr_created_at? : DATETIME (timezone=True)<br/>pr_updated_at? : DATETIME (timezone=True)<br/>head_sha? : VARCHAR(64)<br/>base_branch? : VARCHAR(255)<br/>additions? : INTEGER<br/>deletions? : INTEGER<br/>changed_files? : INTEGER<br/>commit_count? : INTEGER<br/>comment_count? : INTEGER<br/>review_comment_count? : INTEGER<br/>review_count? : INTEGER<br/>approvals? : INTEGER<br/>changes_requested? : INTEGER<br/>labels? : JSON<br/>files? : JSON<br/>comments? : JSON<br/>reviews? : JSON<br/>review_comments? : JSON<br/>commits? : JSON<br/>checks? : JSON<br/>statuses? : JSON<br/>warnings? : JSON<br/>merge_probability? : NUMERIC(5, 2)<br/>quality_score? : NUMERIC(5, 2)<br/>quality? : VARCHAR(30)<br/>confidence? : VARCHAR(20)<br/>summary? : TEXT<br/>merge_reasoning? : TEXT<br/>recommendations? : JSON<br/>potential_improvements? : JSON<br/>limitations? : JSON<br/>probability_note? : TEXT<br/>generated_at : DATETIME"]
 
     user_settings -->|user_id| users
-    plans -->|parent_plan_id| plans
     plan_model_access -->|plan_id| plans
     plan_model_access -->|model_id| models
     subscriptions -->|user_id| users
     subscriptions -->|plan_id| plans
     usage_periods -->|user_id| users
-    pull_requests -->|repository_id| repositories
     predictions -->|user_id| users
     predictions -->|usage_period_id| usage_periods
     predictions -->|model_id| models
-    predictions -->|pull_request_id| pull_requests
-    prediction_inputs -->|prediction_id| predictions
     prediction_results -->|prediction_id| predictions
-    prediction_features -->|prediction_id| predictions
-    prediction_factors -->|result_id| prediction_results
+    prediction_results -->|user_id| users
 ```
 
 ## Keys and constraints
 
 | Table | Key or uniqueness rule |
 | --- | --- |
-| `users` | `user_id` is the primary key; `username` and `email` are individually unique. |
-| `user_settings` | `user_id` is both the primary key and a foreign key to `users`. |
-| `plans` | `plan_id` is the primary key; `code` is unique; the nullable parent references `plans.plan_id`. |
+| `users` | `user_id` is the primary key. `username` and `email` are individually unique. |
+| `user_settings` | `user_id` is both the primary key and a foreign key to `users.user_id`, allowing at most one settings row per user. |
+| `plans` | `plan_id` is the primary key; `code` is unique. There is no parent-plan foreign key. |
+| `plan_model_access` | Composite primary key `(plan_id, model_id)`. Both columns are required foreign keys; duplicate grants are prevented. |
 | `models` | `model_id` is the primary key; `code` is unique. |
-| `plan_model_access` | Composite primary key `(plan_id, model_id)` prevents duplicate direct grants. Both fields are foreign keys. |
-| `subscriptions` | `subscription_id` is the primary key. The application manages the active subscription; the database does not impose one active subscription per user. |
-| `usage_periods` | `usage_period_id` is the primary key; `(user_id, period_start)` is unique. |
-| `repositories` | `repository_id` is the primary key; `(provider, owner, name)` is unique. |
-| `pull_requests` | `pull_request_id` is the primary key; `url` is unique; `(repository_id, number)` is also unique. |
-| `predictions` | `prediction_id` is the primary key; references a user, usage period, model, and optionally a PR. |
-| `prediction_inputs` | `prediction_id` is both the primary key and a foreign key, allowing at most one input per prediction. |
-| `prediction_results` | `result_id` is the primary key; `prediction_id` is a unique foreign key, allowing at most one result per prediction. |
-| `prediction_features` | `feature_id` is the primary key; multiple feature rows may reference one prediction. |
-| `prediction_factors` | `factor_id` is the primary key; multiple factor rows may reference one result. |
+| `subscriptions` | `subscription_id` is the primary key. `user_id` and `plan_id` are required foreign keys. `ended_at` is not nullable. The application manages active subscriptions; there is no database uniqueness rule limiting active subscriptions per user. |
+| `usage_periods` | `usage_period_id` is the primary key; `user_id` is a required foreign key. `time_stamp` is a required DATE. There is no unique constraint on `(user_id, time_stamp)` and no subscription foreign key. |
+| `predictions` | `prediction_id` is the primary key. Required foreign keys reference a user, usage record, and model. `pr_url` is required but not unique. |
+| `prediction_results` | `result_id` is the primary key. `prediction_id` is a required, unique foreign key; `user_id` is a separate required foreign key. The database does not enforce that both references belong to the same user; the application supplies matching IDs. |
 
-Roles (`USER`/`ADMIN`), non-negative plan credits, positive model costs, and acyclic plan inheritance are validated by application code, not database enum/check constraints. Unique indexes are declared on `users.username` and `users.email`; a non-unique index is declared on `predictions.user_id`.
+Role/status values and numeric ranges are checked by application logic and request validation, not database enum/check constraints. Model defaults are supplied by SQLAlchemy; they are not SQL server defaults.
 
-## Current storage and legacy fields
+## Explicit indexes
 
-| Field or table | Current purpose |
+| Index | Columns | Unique |
+| --- | --- | --- |
+| `ix_users_email` | `users.email` | Yes |
+| `ix_users_username` | `users.username` | Yes |
+| `ix_predictions_pr_url` | `predictions.pr_url` | No |
+| `ix_predictions_user_id` | `predictions.user_id` | No |
+| `ix_prediction_results_repository` | `prediction_results.repository` | No |
+| `ix_prediction_results_user_id` | `prediction_results.user_id` | No |
+
+Primary keys and unique constraints are listed separately above.
+
+## Current storage
+
+| Field or group | Purpose |
 | --- | --- |
-| `plans.monthly_credits` | The active plan's monthly credit budget. |
-| `models.credit_cost` | Cost of one successful prediction using this catalog entry. |
-| `usage_periods.credits_used` | Credits already spent by the user in the month; used to enforce the budget. |
-| `usage_periods.credit_limit_snapshot` | Budget when usage was created or last charged; current availability uses the active plan's budget. |
-| `predictions.credits_cost`, `model_version`, `inference_key` | Values saved at prediction time; new inference keys are `gemini-api`. |
-| `prediction_results.analysis_response` | Nullable JSON containing the full hosted service response; null for old predictions without a saved response. |
-| `plans.monthly_prediction_limit`, `usage_periods.limit_snapshot` | Compatibility fields from the old prediction-count system; credit checks no longer use them. |
-| `models.artifact_key` | Compatibility metadata; no local artifact is loaded. |
-| `prediction_inputs.raw_feature_text` | Old manual-input data; new requests store `github_url` with `input_mode = GITHUB_URL`. |
-| `prediction_features`, `prediction_factors` | Kept to read older history. New feature/analysis details are stored in the JSON response. |
+| `plans.credits`, `plans.duration` | Credit allowance and duration in days. ORM defaults are 5 credits and 1 day. |
+| `subscriptions.started_at`, `subscriptions.ended_at` | The subscription start and required end time. The application calculates the end from the selected plan duration. |
+| `models.provider`, `models.credit_cost` | Provider metadata and cost per successful prediction. ORM defaults are `local` and 1 credit; seeded models use `gemini-api`. |
+| `usage_periods.time_stamp`, `usage_periods.credits_used` | The date used for usage lookup and credits spent. The app looks up the subscription start date and carries spent credits when switching plans. |
+| `predictions.pr_url`, `status`, `credits_cost`, `http_status`, `error_message` | The requested PR, outcome, actual charge, and failure information. Analyzer failures have no result and charge zero credits. |
+| `prediction_results.user_id`, `pr_url`, `repository`, `pr_number`, `title` | Required ownership and PR metadata. Repository is text, not a foreign key. |
+| Other PR metadata columns | Description, author, PR state, timestamps, branches, SHA, change counts, and review counts. |
+| Feature JSON columns | `labels`, `files`, `comments`, `reviews`, `review_comments`, `commits`, `checks`, `statuses`, and `warnings`. |
+| Analysis columns | `merge_probability`, `quality_score`, `quality`, `confidence`, `summary`, and `merge_reasoning`. The two score columns use `NUMERIC(5, 2)`. |
+| Analysis JSON columns | `recommendations`, `potential_improvements`, and `limitations`. |
+| `probability_note`, `generated_at` | The analyzer caveat and time the result was saved. |
 
-Fresh databases seed Free with 5 credits and model 1, Plus with 30 credits and models 1–3, Pro with 100 credits and Plus access plus models 4–6, and Ultra with 300 credits and Pro access. Admins can change credits, model costs, and access. These are seed values, not database constraints; there is no current unlimited-plan rule.
+`pr_created_at` and `pr_updated_at` are declared as `DateTime(timezone=True)`. The application converts their values to UTC before storage; SQLite stores them without an offset. Other datetime columns use the default `timezone=False`.
 
-There are no separate admin, history, or API-token tables. Admin rights come from `users.role`; history queries the prediction tables; the hosted-service token comes from the `PR_ANALYZER_TOKEN` environment variable. Existing databases are upgraded by additive migrations, so older physical constraints can differ from the current model declarations shown here.
+## Seed values
+
+| Plan | Credits | Duration in days | Assigned models |
+| --- | --- | --- | --- |
+| FREE | 5 | 1 | model-1 |
+| PLUS | 30 | 30 | models 1-3 |
+| PRO | 100 | 30 | models 1-6 |
+| ULTRA | 300 | 30 | models 1-6 |
+
+These are defaults for new records, not database constraints. Admin changes survive seeding. All model assignments are direct.
+
+There are no separate admin, history, or API-token tables. Admin rights use `users.role`, history reads predictions/results, and the analyzer token comes from `PR_ANALYZER_TOKEN`.
+
+The current models do not declare the old repository, pull-request, input, feature, or factor tables, monthly-credit snapshots, model artifact keys, prediction types/versions, or a full-response JSON column. Startup creates missing current tables and runs the supported legacy SQLite migration; archived physical tables are outside this model diagram.
