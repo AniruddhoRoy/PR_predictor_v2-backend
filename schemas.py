@@ -109,6 +109,11 @@ class PlanCreate(BaseModel):
     active: bool = True
     model_config = ConfigDict(populate_by_name=True)
 
+    @field_validator("code", mode="before")
+    @classmethod
+    def strip_code(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
 
 class PlanUpdate(BaseModel):
     code: Optional[str] = Field(default=None, min_length=2, max_length=80)
@@ -119,3 +124,8 @@ class PlanUpdate(BaseModel):
     description: Optional[str] = None
     active: Optional[bool] = None
     model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("code", mode="before")
+    @classmethod
+    def strip_code(cls, value):
+        return value.strip() if isinstance(value, str) else value

@@ -112,6 +112,25 @@ class CreditPlansTest(unittest.TestCase):
         self.assertEqual(response.json()['fullName'], 'Updated')
         self.assertEqual(response.json()['email'], 'updated@example.com')
 
+    def test_plan_codes_are_validated_after_trimming(self):
+        plans = self.client.get('/admin/api/plans', headers=self.admin).json()
+        plus = next(plan for plan in plans if plan['code'] == 'PLUS')
+        path = '/admin/api/plans/' + plus['planId']
+        for code in ('  ', '\t\t', ' X ', 'x' * 81):
+            with self.subTest(code=code):
+                self.assertEqual(self.client.post('/admin/api/plans', headers=self.admin, json={'code': code, 'name': 'Invalid'}).status_code, 422)
+                self.assertEqual(self.client.patch(path, headers=self.admin, json={'code': code}).status_code, 422)
+        with self.sessions() as db:
+            self.assertEqual(db.query(Plan).count(), 4)
+            self.assertEqual(db.get(Plan, plus['planId']).code, 'PLUS')
+        self.assertEqual(self.client.patch(path, headers=self.admin, json={}).status_code, 200)
+        created = self.client.post('/admin/api/plans', headers=self.admin, json={'code': ' custom ', 'name': 'Custom'})
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.json()['code'], 'CUSTOM')
+        updated = self.client.patch(path, headers=self.admin, json={'code': ' plus-new '})
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()['code'], 'PLUS-NEW')
+
     def test_admin_changes_survive_restart(self):
         plans = self.client.get('/admin/api/plans', headers=self.admin).json()
         plus = next(p for p in plans if p['code'] == 'PLUS')

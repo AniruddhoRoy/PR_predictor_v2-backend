@@ -803,7 +803,7 @@ Admin model responses extend public model objects with active (boolean), created
 
 ### Plan write fields
 
-POST requires code and name; credits defaults to 5 and duration defaults to 1 day. PATCH accepts the same fields, all optional.
+POST requires code and name; credits defaults to 5 and duration defaults to 1 day. PATCH accepts the same fields, all optional. Plan codes must have 2-80 characters after trimming; blank or invalid-length codes return 422 on both create and update.
 
 | Field          | Type             | Create default / rules                                           |
 | -------------- | ---------------- | ---------------------------------------------------------------- |
