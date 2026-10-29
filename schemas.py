@@ -19,6 +19,11 @@ class RegisterRequest(BaseModel):
     github_profile_url: Optional[str] = Field(default=None, alias="githubProfileUrl")
     model_config = ConfigDict(populate_by_name=True) #! this is to allow the model to be populated by name (accept both alias and field name from the frontend)
 
+    @field_validator("username", "email", "full_name", mode="before")
+    @classmethod
+    def strip_identity_fields(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
 
 class LoginRequest(BaseModel):
     username: str
@@ -32,17 +37,17 @@ class ChangePasswordRequest(BaseModel):
 
 
 class ProfileUpdate(BaseModel):
-    full_name: Optional[str] = Field(default=None, alias="fullName")
-    email: Optional[str] = None #! this is equivalent to upper one
+    full_name: Optional[str] = Field(default=None, min_length=1, max_length=150, alias="fullName")
+    email: Optional[str] = Field(default=None, min_length=5, max_length=255)
     github_profile_url: Optional[str] = Field(default=None, alias="githubProfileUrl")
     model_config = ConfigDict(populate_by_name=True)
 
-    @field_validator("email")
+    @field_validator("email", "full_name", mode="before")
     @classmethod
-    def email_not_null(cls, value):
+    def validate_identity_fields(cls, value):
         if value is None:
-            raise ValueError("email cannot be null")
-        return value
+            raise ValueError("Profile name and email cannot be null")
+        return value.strip() if isinstance(value, str) else value
 
 
 class SettingsUpdate(BaseModel):

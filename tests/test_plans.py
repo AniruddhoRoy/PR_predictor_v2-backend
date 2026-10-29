@@ -87,6 +87,31 @@ class CreditPlansTest(unittest.TestCase):
             self.assertEqual(db.query(Prediction).one().http_status, 502)
             self.assertEqual(db.query(Prediction).one().status, 'FAILED')
 
+    def test_registration_identity_validation(self):
+        body = {'username': 'new-user', 'email': 'new@example.com', 'password': ' pass ', 'fullName': 'New User'}
+        for field, value in [('username', '   '), ('username', ' ab '), ('username', 'x' * 81),
+                             ('email', '     '), ('email', 'x' * 256), ('fullName', ' '), ('fullName', 'x' * 151)]:
+            with self.subTest(field=field, value=value):
+                self.assertEqual(self.client.post('/register', json={**body, field: value}).status_code, 422)
+        response = self.client.post('/register', json={**body, 'username': '  new-user  ', 'email': ' NEW@example.com ', 'fullName': ' New User '})
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()['user']['username'], 'new-user')
+        self.assertEqual(response.json()['user']['email'], 'new@example.com')
+        self.assertEqual(response.json()['user']['fullName'], 'New User')
+        self.assertEqual(self.client.post('/login', json={'username': 'new-user', 'password': ' pass '}).status_code, 200)
+
+    def test_profile_identity_validation(self):
+        before = self.client.get('/profile', headers=self.headers).json()
+        for field, value in [('fullName', '   '), ('fullName', 'x' * 151), ('fullName', None),
+                             ('email', '     '), ('email', 'x' * 256), ('email', None)]:
+            with self.subTest(field=field, value=value):
+                self.assertEqual(self.client.patch('/profile', headers=self.headers, json={field: value}).status_code, 422)
+        self.assertEqual(self.client.get('/profile', headers=self.headers).json(), before)
+        response = self.client.patch('/profile', headers=self.headers, json={'fullName': ' Updated ', 'email': ' UPDATED@example.com '})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['fullName'], 'Updated')
+        self.assertEqual(response.json()['email'], 'updated@example.com')
+
     def test_admin_changes_survive_restart(self):
         plans = self.client.get('/admin/api/plans', headers=self.admin).json()
         plus = next(p for p in plans if p['code'] == 'PLUS')

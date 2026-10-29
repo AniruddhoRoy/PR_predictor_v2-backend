@@ -121,6 +121,8 @@ No path or query parameters. Checks service liveness, not database connectivity 
 
 Authentication: **Public**.
 
+Identity fields are trimmed before validation: username must have 3-80 characters, email 5-255, and fullName 1-150. Blank or oversized values return 422. Password whitespace is preserved.
+
 Creates a USER, default settings, and a FREE subscription when the active FREE plan exists. Signs the user in immediately.
 
 | Field            | Type           | Required | Rules                                                           |
@@ -230,7 +232,7 @@ No path/query parameters. Current public account information. `GET /profile` is 
 
 Authentication: **User**.
 
-All fields are optional: fullName (string), email (string), githubProfileUrl (string or null). Null clears githubProfileUrl. Send a string for email; explicit null returns 422 and leaves the profile unchanged. Duplicate email returns 409: `Email is already registered`. Email is trimmed/lowercased, fullName is trimmed. This route cannot change username, password, or role.
+All fields are optional: fullName (1-150 characters after trimming), email (5-255 characters after trimming), githubProfileUrl (string or null). Blank, oversized, or null fullName/email values return 422. Null clears githubProfileUrl. Send a string for email; explicit null returns 422 and leaves the profile unchanged. Duplicate email returns 409: `Email is already registered`. Email is trimmed/lowercased, fullName is trimmed. This route cannot change username, password, or role.
 
 **Request body:**
 
