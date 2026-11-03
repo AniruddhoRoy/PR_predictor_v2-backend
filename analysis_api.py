@@ -9,7 +9,7 @@ from urllib.request import Request, urlopen
 from fastapi import HTTPException
 
 
-ANALYZE_URL = "https://pr-predictor-backend-gemini-api.onrender.com/analyze"
+ANALYZE_URL = os.getenv("ANALYZE_URL", "").strip()
 PR_URL = re.compile(r"https://github\.com/([\w-]+)/([\w.-]+)/pull/([1-9][0-9]*)/?", re.ASCII | re.I)
 ERRORS = {
     401: "Analysis service rejected its API token; check PR_ANALYZER_TOKEN",
