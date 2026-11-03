@@ -10,12 +10,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import MetaData, func, inspect, or_
 from sqlalchemy.orm import Session
+
+load_dotenv(Path(__file__).with_name(".env"))
 
 from auth import create_token, hash_password, read_token, verify_password
 from database import Base, SessionLocal, engine, get_db

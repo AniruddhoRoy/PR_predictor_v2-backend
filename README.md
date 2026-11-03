@@ -4,6 +4,8 @@ This is the small FastAPI service for the JavaFX PR Predictor project. It stores
 
 ## Run locally
 
+The backend automatically loads `.env` from the project folder before reading configuration. Set `PR_ANALYZER_TOKEN` there or in the server environment; existing environment variables take priority. Restart the backend after changing `.env`.
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
